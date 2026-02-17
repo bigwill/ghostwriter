@@ -15,6 +15,7 @@ dependencies = [
     "reportlab>=4.0",
     "dpt-rp1-py>=0.1.16",
     "nltk>=3.8",
+    "lemminflect>=0.2.3",
 ]
 
 [project.scripts]

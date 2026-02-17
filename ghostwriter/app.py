@@ -67,6 +67,11 @@ CSS = """\
     margin-bottom: 1;
 }
 
+#cand-label {
+    color: $text-muted;
+    margin-bottom: 0;
+}
+
 #candidates {
     height: 1fr;
     min-height: 6;
@@ -104,9 +109,9 @@ class GhostwriterApp(App):
     CSS = CSS
 
     BINDINGS = [
-        Binding("ctrl+m", "morph_word", "Morph word"),
-        Binding("ctrl+r", "render_pdf", "Render PDF"),
-        Binding("ctrl+p", "push_device", "Push to DPT-RP1"),
+        Binding("f2", "morph_word", "Morph word"),
+        Binding("f3", "render_pdf", "Render PDF"),
+        Binding("f4", "push_device", "Push to DPT-RP1"),
         Binding("ctrl+s", "save_poem", "Save poem"),
         Binding("ctrl+o", "load_poem", "Load poem"),
         Binding("ctrl+q", "quit", "Quit"),
@@ -129,12 +134,16 @@ class GhostwriterApp(App):
             with Vertical(id="editor-pane"):
                 yield TextArea(id="editor", language=None, soft_wrap=True)
             with Vertical(id="side-pane"):
-                yield Label("vibe direction", id="vibe-label")
+                yield Label("1. enter a vibe direction", id="vibe-label")
                 yield Input(
-                    placeholder="enter a vibe word (e.g. dread, warmth, alien)",
+                    placeholder="e.g. dread, warmth, alien",
                     id="vibe-input",
                 )
-                yield Label("no word selected", id="word-label")
+                yield Label(
+                    "2. place cursor on a word, press [bold]F2[/bold]",
+                    id="word-label",
+                )
+                yield Label("3. pick a replacement below", id="cand-label")
                 yield OptionList(id="candidates")
                 with VerticalScroll(id="morphed-section"):
                     yield Label("morphed words", id="morphed-header")
@@ -161,7 +170,7 @@ class GhostwriterApp(App):
             if event.state == WorkerState.RUNNING:
                 bar.update("Loading embeddings (first run downloads ~128 MB)…")
             elif event.state == WorkerState.SUCCESS:
-                bar.update("Ready")
+                bar.update("Ready — write a poem, enter a vibe, put cursor on a word, press F2")
             elif event.state == WorkerState.ERROR:
                 bar.update(f"Model load failed: {event.worker.error}")
 
@@ -187,7 +196,7 @@ class GhostwriterApp(App):
                 word = m.group()
                 self._selected_word = word
                 self.query_one("#word-label", Label).update(
-                    f"morphing: [bold]{word}[/bold]"
+                    f"morphing: [bold]{word}[/bold]  (F2 to pick another)"
                 )
                 self._fetch_candidates(word)
                 return
@@ -264,7 +273,9 @@ class GhostwriterApp(App):
         self.morphed[original.lower()] = replacement.lower()
         self._refresh_morphed_list()
         self._selected_word = None
-        self.query_one("#word-label", Label).update("no word selected")
+        self.query_one("#word-label", Label).update(
+            "2. place cursor on a word, press [bold]F2[/bold]"
+        )
         self.query_one("#candidates", OptionList).clear_options()
         self.query_one("#status-bar", Static).update(
             f"'{original}' → '{replacement}'"

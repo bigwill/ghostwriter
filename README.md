@@ -19,10 +19,10 @@ On first launch the app downloads GloVe word vectors (~128 MB, cached locally).
 ## How it works
 
 1. **Write** a poem or paste one into the editor.
-2. **Select** words you want to morph.
-3. **Enter a vibe** — a single word like *dread*, *warmth*, *alien*.
-4. **Review** ranked replacement candidates produced by embedding arithmetic.
-5. **Render** a ghosted PDF and **push** it to your DPT-RP1.
+2. **Enter a vibe** — a single word like *dread*, *warmth*, *alien*.
+3. **Place cursor** on a word and press **F2** to morph it.
+4. **Pick** a replacement from the ranked candidates.
+5. **Render** a ghosted PDF (**F3**) and **push** it to your DPT-RP1 (**F4**).
 
 ## Dependencies
 

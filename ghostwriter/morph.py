@@ -1,10 +1,18 @@
-"""Embedding-based word morphing engine.
+"""Word morphing engine: thesaurus + embedding arithmetic.
 
-Uses GloVe vectors (via gensim) to shift words toward a target "vibe"
-through vector arithmetic:
+Combines WordNet synonym lookups with GloVe vector arithmetic so that
+replacement candidates:
 
-    morphed ≈ word + target_vibe − source_vibe
+  1. Match the original word's part of speech.
+  2. Preserve tense / plural form (via lemminflect).
+  3. Drift toward a user-supplied "vibe" direction.
 
+The vector arithmetic is:
+
+    target ≈ word + vibe − source_vibe
+
+Candidates from both WordNet and embeddings are scored against this
+target vector, then re-inflected to be drop-in replacements.
 """
 
 from __future__ import annotations
@@ -13,6 +21,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
+import numpy as np
 import gensim.downloader as api
 from gensim.models import KeyedVectors
 
@@ -42,7 +51,7 @@ class Candidate:
     """A single replacement suggestion for a word."""
 
     word: str
-    score: float  # cosine similarity
+    score: float  # cosine similarity to target vector
 
 
 @dataclass
@@ -56,37 +65,131 @@ class MorphResult:
 
 
 # ---------------------------------------------------------------------------
-# POS heuristic (lightweight, no nltk download required at import time)
+# NLTK bootstrap
 # ---------------------------------------------------------------------------
 
-try:
+_NLTK_READY = False
+
+
+def _ensure_nltk() -> None:
+    """Download required NLTK data on first use."""
+    global _NLTK_READY
+    if _NLTK_READY:
+        return
     import nltk
-    from nltk.tag import pos_tag as _pos_tag
 
-    def _ensure_tagger() -> None:
+    for resource, path in [
+        ("averaged_perceptron_tagger_eng", "taggers/averaged_perceptron_tagger_eng"),
+        ("wordnet", "corpora/wordnet"),
+    ]:
         try:
-            nltk.data.find("taggers/averaged_perceptron_tagger_eng")
+            nltk.data.find(path)
         except LookupError:
-            nltk.download("averaged_perceptron_tagger_eng", quiet=True)
+            nltk.download(resource, quiet=True)
+    _NLTK_READY = True
 
-    def pos_tag(word: str) -> str | None:
-        """Return a coarse POS tag (noun / verb / adj / adv) or None."""
-        _ensure_tagger()
-        tag = _pos_tag([word])[0][1]
-        if tag.startswith("NN"):
-            return "noun"
-        if tag.startswith("VB"):
-            return "verb"
-        if tag.startswith("JJ"):
-            return "adj"
-        if tag.startswith("RB"):
-            return "adv"
+
+# ---------------------------------------------------------------------------
+# POS helpers
+# ---------------------------------------------------------------------------
+
+
+def _pos_tag_word(word: str) -> str | None:
+    """Return the Penn Treebank POS tag for a single word, or None."""
+    try:
+        _ensure_nltk()
+        from nltk.tag import pos_tag as _pos_tag
+
+        return _pos_tag([word])[0][1]
+    except Exception:
         return None
 
-except ImportError:  # nltk not installed
 
-    def pos_tag(word: str) -> str | None:  # type: ignore[misc]
+def _ptb_to_wordnet(tag: str):
+    """Convert a Penn Treebank tag to a WordNet POS constant."""
+    from nltk.corpus import wordnet
+
+    if tag.startswith("NN"):
+        return wordnet.NOUN
+    if tag.startswith("VB"):
+        return wordnet.VERB
+    if tag.startswith("JJ"):
+        return wordnet.ADJ
+    if tag.startswith("RB"):
+        return wordnet.ADV
+    return None
+
+
+def _coarse_pos(tag: str | None) -> str | None:
+    """Coarse POS bucket from a PTB tag."""
+    if tag is None:
         return None
+    if tag.startswith("NN"):
+        return "noun"
+    if tag.startswith("VB"):
+        return "verb"
+    if tag.startswith("JJ"):
+        return "adj"
+    if tag.startswith("RB"):
+        return "adv"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# WordNet synonyms
+# ---------------------------------------------------------------------------
+
+
+def _wordnet_synonyms(lemma: str, wn_pos) -> set[str]:
+    """All single-word synonyms from WordNet for a lemma + POS.
+
+    Includes direct synonyms plus one hop of hypernyms, hyponyms, and
+    similar-tos for broader coverage.
+    """
+    from nltk.corpus import wordnet
+
+    out: set[str] = set()
+    for syn in wordnet.synsets(lemma, pos=wn_pos):
+        for lem in syn.lemmas():
+            w = lem.name().lower()
+            if "_" not in w and w != lemma:
+                out.add(w)
+        # One hop outward for more variety
+        related = syn.hypernyms() + syn.hyponyms()
+        if hasattr(syn, "similar_tos"):
+            related += syn.similar_tos()
+        for rel in related:
+            for lem in rel.lemmas():
+                w = lem.name().lower()
+                if "_" not in w and w != lemma:
+                    out.add(w)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Lemmatization & inflection
+# ---------------------------------------------------------------------------
+
+
+def _lemmatize(word: str, wn_pos) -> str:
+    """Reduce a word to its base form."""
+    from nltk.stem import WordNetLemmatizer
+
+    return WordNetLemmatizer().lemmatize(word, pos=wn_pos)
+
+
+def _inflect(word: str, target_tag: str) -> str:
+    """Re-inflect *word* to match *target_tag* (e.g. VBG, NNS).
+
+    Uses lemminflect when available, otherwise returns the word unchanged.
+    """
+    try:
+        import lemminflect
+
+        forms = lemminflect.getInflection(word, tag=target_tag)
+        return forms[0] if forms else word
+    except (ImportError, Exception):
+        return word
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +210,7 @@ def morph_word(
     top_n: int = 8,
     model: KeyedVectors | None = None,
 ) -> MorphResult:
-    """Shift *word* toward *target_vibe* using vector arithmetic.
+    """Shift *word* toward *target_vibe*, returning drop-in replacements.
 
     Parameters
     ----------
@@ -124,7 +227,7 @@ def morph_word(
 
     Returns
     -------
-    MorphResult with ranked candidates.
+    MorphResult with ranked candidates that match POS and inflection.
     """
     if model is None:
         model = load_model()
@@ -134,47 +237,89 @@ def morph_word(
     low = word.lower()
     vibe_low = target_vibe.lower()
 
-    if not _in_vocab(model, low):
-        return result
-    if not _in_vocab(model, vibe_low):
+    if not _in_vocab(model, low) or not _in_vocab(model, vibe_low):
         return result
 
+    # -- POS & lemma --------------------------------------------------------
+    ptb_tag = _pos_tag_word(low)
+    wn_pos = _ptb_to_wordnet(ptb_tag) if ptb_tag else None
+    coarse = _coarse_pos(ptb_tag)
+    lemma = _lemmatize(low, wn_pos) if wn_pos else low
+
+    # -- Build target vector (word + vibe − source_vibe) --------------------
+    target_vec = model[low].astype(np.float64) + model[vibe_low].astype(np.float64)
+    if source_vibe and _in_vocab(model, source_vibe.lower()):
+        target_vec -= model[source_vibe.lower()].astype(np.float64)
+    norm = np.linalg.norm(target_vec)
+    if norm > 0:
+        target_vec /= norm
+
+    # -- Candidate pool (base-form words) -----------------------------------
+    pool: set[str] = set()
+
+    # Source 1: WordNet synonyms (already same-POS by construction)
+    if wn_pos:
+        pool |= _wordnet_synonyms(lemma, wn_pos)
+
+    # Source 2: embedding neighbours via vector arithmetic
     positive = [low, vibe_low]
-    negative = []
+    negative: list[str] = []
     if source_vibe and _in_vocab(model, source_vibe.lower()):
         negative = [source_vibe.lower()]
-
     try:
-        raw = model.most_similar(positive=positive, negative=negative or None, topn=top_n * 3)
+        raw = model.most_similar(
+            positive=positive,
+            negative=negative or None,
+            topn=top_n * 5,
+        )
+        for cand_word, _score in raw:
+            cw = cand_word.lower()
+            if cw in (low, vibe_low, lemma):
+                continue
+            if not _WORD_RE.match(cw):
+                continue
+            # Hard POS filter: only keep same coarse POS
+            if coarse:
+                cand_tag = _pos_tag_word(cw)
+                if _coarse_pos(cand_tag) != coarse:
+                    continue
+            # Lemmatize so the pool is always base forms
+            if wn_pos:
+                cw = _lemmatize(cw, wn_pos)
+            if cw in (low, vibe_low, lemma):
+                continue
+            pool.add(cw)
     except KeyError:
-        return result
+        pass
 
-    # Determine the original word's coarse POS so we can prefer same-POS matches.
-    orig_pos = pos_tag(low)
+    # -- Score each candidate against the target vector ---------------------
+    scored: list[tuple[str, float]] = []
+    for cand in pool:
+        if not _in_vocab(model, cand):
+            continue
+        cand_vec = model[cand].astype(np.float64)
+        cand_norm = np.linalg.norm(cand_vec)
+        if cand_norm == 0:
+            continue
+        sim = float(np.dot(target_vec, cand_vec) / cand_norm)
+        scored.append((cand, sim))
 
+    scored.sort(key=lambda x: x[1], reverse=True)
+
+    # -- Inflect to match original form & deduplicate -----------------------
     seen: set[str] = set()
-    for candidate_word, score in raw:
-        # Keep only clean single words, skip the input itself.
-        cw = candidate_word.lower()
-        if cw in (low, vibe_low):
+    for cand_lemma, score in scored:
+        inflected = _inflect(cand_lemma, ptb_tag) if ptb_tag else cand_lemma
+        il = inflected.lower()
+        if il in seen or il == low:
             continue
-        if not _WORD_RE.match(cw):
-            continue
-        if cw in seen:
-            continue
-        seen.add(cw)
-
-        # Soft POS filter: prefer same POS but don't hard-reject.
-        cand_pos = pos_tag(cw)
-        if orig_pos and cand_pos and cand_pos != orig_pos:
-            score *= 0.85  # demote slightly
-
-        result.candidates.append(Candidate(word=cw, score=round(score, 4)))
+        seen.add(il)
+        result.candidates.append(
+            Candidate(word=inflected, score=round(score, 4))
+        )
         if len(result.candidates) >= top_n:
             break
 
-    # Re-sort after POS adjustment.
-    result.candidates.sort(key=lambda c: c.score, reverse=True)
     return result
 
 
