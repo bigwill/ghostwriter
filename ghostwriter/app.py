@@ -6,6 +6,7 @@ Run with:  ghostwriter   (or  python -m ghostwriter.app)
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -13,23 +14,61 @@ from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.timer import Timer
 from textual.widgets import (
     Footer,
     Header,
     Input,
     Label,
-    OptionList,
     Static,
     TextArea,
 )
-from textual.widgets.option_list import Option
 from textual.worker import Worker, WorkerState
+
+# ---------------------------------------------------------------------------
+# Token model
+# ---------------------------------------------------------------------------
+
+_TOKEN_RE = re.compile(r"[A-Za-z]+")
+
+
+@dataclass
+class Token:
+    """A piece of text in the poem — either a word or non-word."""
+
+    text: str
+    is_word: bool = False
+    tagged: bool = False
+    candidates: list[str] = field(default_factory=list)
+    cycle_index: int = 0
+    locked: bool = False
+
+    @property
+    def display(self) -> str:
+        if self.tagged and self.candidates:
+            return self.candidates[self.cycle_index]
+        return self.text
+
+
+def _tokenize_line(line: str) -> list[Token]:
+    """Split a line into alternating word / non-word tokens."""
+    tokens: list[Token] = []
+    last = 0
+    for m in _TOKEN_RE.finditer(line):
+        if m.start() > last:
+            tokens.append(Token(text=line[last : m.start()]))
+        tokens.append(Token(text=m.group(), is_word=True))
+        last = m.end()
+    if last < len(line):
+        tokens.append(Token(text=line[last:]))
+    if not tokens:
+        tokens.append(Token(text=""))
+    return tokens
+
 
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
-
-_WORD_RE = re.compile(r"[A-Za-z]+")
 
 CSS = """\
 #main {
@@ -61,18 +100,12 @@ CSS = """\
     margin-bottom: 1;
 }
 
-#word-label {
-    color: $text;
-    text-style: bold;
+#help-label {
+    color: $text-muted;
     margin-bottom: 1;
 }
 
-#cand-label {
-    color: $text-muted;
-    margin-bottom: 0;
-}
-
-#candidates {
+#tagged-list {
     height: 1fr;
     min-height: 6;
 }
@@ -109,7 +142,12 @@ class GhostwriterApp(App):
     CSS = CSS
 
     BINDINGS = [
-        Binding("f2", "morph_word", "Morph word"),
+        Binding("f2", "tag_word", "Tag word"),
+        Binding("f5", "start_cycling", "Cycle"),
+        Binding("f6", "freeze_all", "Freeze all"),
+        Binding("f7", "lock_word", "Lock word"),
+        Binding("f8", "toggle_highlight", "Highlight"),
+        Binding("escape", "stop_cycling", "Stop", show=False),
         Binding("f3", "render_pdf", "Render PDF"),
         Binding("f4", "push_device", "Push to DPT-RP1"),
         Binding("ctrl+s", "save_poem", "Save poem"),
@@ -119,12 +157,13 @@ class GhostwriterApp(App):
 
     def __init__(self) -> None:
         super().__init__()
-        # word -> replacement mapping
         self.morphed: dict[str, str] = {}
-        # currently selected word for morphing
-        self._selected_word: Optional[str] = None
-        # model loaded flag
         self._model_ready = False
+        self._poem_tokens: list[list[Token]] = []
+        self._tokenized_text: str = ""
+        self._cycling = False
+        self._cycle_timer: Optional[Timer] = None
+        self._highlight: bool = True
 
     # ---- layout ----------------------------------------------------------
 
@@ -134,17 +173,17 @@ class GhostwriterApp(App):
             with Vertical(id="editor-pane"):
                 yield TextArea(id="editor", language=None, soft_wrap=True)
             with Vertical(id="side-pane"):
-                yield Label("1. enter a vibe direction", id="vibe-label")
+                yield Label("1. enter a vibe", id="vibe-label")
                 yield Input(
                     placeholder="e.g. dread, warmth, alien",
                     id="vibe-input",
                 )
                 yield Label(
-                    "2. place cursor on a word, press [bold]F2[/bold]",
-                    id="word-label",
+                    "F2=tag  F5=cycle  F7=lock  Esc/F6=stop  F8=highlight",
+                    id="help-label",
                 )
-                yield Label("3. pick a replacement below", id="cand-label")
-                yield OptionList(id="candidates")
+                yield Label("tagged words", id="tagged-header")
+                yield Static("(none)", id="tagged-list")
                 with VerticalScroll(id="morphed-section"):
                     yield Label("morphed words", id="morphed-header")
                     yield Static("(none yet)", id="morphed-list")
@@ -155,11 +194,14 @@ class GhostwriterApp(App):
 
     def on_mount(self) -> None:
         self._load_model()
+        self._cycle_timer = self.set_interval(
+            2.5, self._cycle_tick, pause=True
+        )
 
     @work(thread=True, group="model")
     def _load_model(self) -> None:
         """Download / cache the GloVe model in a background thread."""
-        from ghostwriter.morph import load_model  # noqa: delayed import
+        from ghostwriter.morph import load_model
 
         load_model()
         self._model_ready = True
@@ -170,42 +212,188 @@ class GhostwriterApp(App):
             if event.state == WorkerState.RUNNING:
                 bar.update("Loading embeddings (first run downloads ~128 MB)…")
             elif event.state == WorkerState.SUCCESS:
-                bar.update("Ready — write a poem, enter a vibe, put cursor on a word, press F2")
+                bar.update("Ready — F2 to tag words, F5 to cycle")
             elif event.state == WorkerState.ERROR:
                 bar.update(f"Model load failed: {event.worker.error}")
 
-    # ---- word selection --------------------------------------------------
+    # ---- tokenizer -------------------------------------------------------
 
-    def action_morph_word(self) -> None:
-        """Pick the word under the cursor in the editor and show candidates."""
+    def _ensure_tokenized(self) -> None:
+        """Tokenize the editor text if it changed since last tokenization."""
         editor = self.query_one("#editor", TextArea)
         text = editor.text
-        if not text:
-            return
+        if text != self._tokenized_text:
+            self._poem_tokens = [
+                _tokenize_line(line) for line in text.splitlines()
+            ]
+            self._tokenized_text = text
 
-        # Get cursor position and find the word at that location
-        row, col = editor.cursor_location
-        lines = text.splitlines()
-        if row >= len(lines):
-            return
-        line = lines[row]
+    def _editor_display(self, t: Token) -> str:
+        """How a token renders in the editor during cycling.
 
-        # Find the word surrounding the cursor column
-        for m in _WORD_RE.finditer(line):
-            if m.start() <= col <= m.end():
-                word = m.group()
-                self._selected_word = word
-                self.query_one("#word-label", Label).update(
-                    f"morphing: [bold]{word}[/bold]  (F2 to pick another)"
-                )
-                self._fetch_candidates(word)
-                return
+        During cycling, tagged words are padded to the width of the longest
+        candidate (including the original word) so the layout stays stable.
+        When highlight is on, unlocked cycling words get «guillemet» markers.
+        """
+        if self._cycling and t.tagged and t.candidates:
+            word = t.candidates[t.cycle_index]
+            max_len = max(len(t.text), *(len(c) for c in t.candidates))
+            padded = word.ljust(max_len)
+            if self._highlight and not t.locked:
+                return f"«{padded}»"
+            return padded
+        return t.display
 
-        self.query_one("#status-bar", Static).update(
-            "Place cursor on a word first"
+    def _rebuild_text(self) -> str:
+        """Rebuild display text from tokens (padded + markers during cycling)."""
+        return "\n".join(
+            "".join(self._editor_display(t) for t in line_tokens)
+            for line_tokens in self._poem_tokens
         )
 
-    def _fetch_candidates(self, word: str) -> None:
+    def _final_text(self) -> str:
+        """Rebuild text with actual replacements — no padding or markers."""
+        return "\n".join(
+            "".join(t.display for t in line_tokens)
+            for line_tokens in self._poem_tokens
+        )
+
+    def _refresh_editor(self) -> None:
+        """Reload editor text from tokens, preserving cursor position."""
+        editor = self.query_one("#editor", TextArea)
+        cursor = editor.cursor_location
+        editor.load_text(self._rebuild_text())
+        new_lines = editor.text.splitlines()
+        if new_lines:
+            row = min(cursor[0], len(new_lines) - 1)
+            col = min(cursor[1], len(new_lines[row]))
+        else:
+            row, col = 0, 0
+        editor.cursor_location = (row, col)
+
+    def _token_at_cursor(self) -> Optional[Token]:
+        """Find the word Token at the current cursor position."""
+        editor = self.query_one("#editor", TextArea)
+        row, col = editor.cursor_location
+        if row >= len(self._poem_tokens):
+            return None
+        pos = 0
+        for token in self._poem_tokens[row]:
+            end_pos = pos + len(self._editor_display(token))
+            if pos <= col < end_pos and token.is_word:
+                return token
+            pos = end_pos
+        return None
+
+    def _tagged_words(self) -> list[Token]:
+        """All currently tagged tokens."""
+        return [
+            t
+            for line_tokens in self._poem_tokens
+            for t in line_tokens
+            if t.tagged
+        ]
+
+    def _line_context(self, token: Token) -> list[str]:
+        """Return the words from the line containing *token*.
+
+        This gives the POS tagger surrounding context so it can
+        disambiguate words like "understanding" (noun vs. verb).
+        """
+        for line_tokens in self._poem_tokens:
+            if token in line_tokens:
+                return [t.text.lower() for t in line_tokens if t.is_word]
+        return []
+
+    # ---- tag / untag (F2) ------------------------------------------------
+
+    def action_tag_word(self) -> None:
+        """Toggle the tagged state of the word under the cursor.
+
+        Works both outside and during cycling:
+        - During cycling, untagging a word commits its current candidate.
+        - During cycling, tagging a new word launches a background morph
+          and adds it to the cycle once candidates arrive.
+        """
+        if self._cycling:
+            token = self._token_at_cursor()
+            if token is None:
+                self.query_one("#status-bar", Static).update(
+                    "Place cursor on a word"
+                )
+                return
+
+            if token.tagged:
+                # Untag: commit the current candidate and remove from cycling
+                current = (
+                    token.candidates[token.cycle_index]
+                    if token.candidates
+                    else token.text
+                )
+                self.morphed[token.text.lower()] = current.lower()
+                token.text = current
+                token.tagged = False
+                token.candidates = []
+                token.cycle_index = 0
+                token.locked = False
+                self._refresh_morphed_list()
+                self.query_one("#status-bar", Static).update(
+                    f"Committed: {current}"
+                )
+
+                still_cycling = [
+                    t
+                    for t in self._tagged_words()
+                    if not t.locked and t.candidates
+                ]
+                if not still_cycling:
+                    self._finish_cycling()
+                else:
+                    self._refresh_editor()
+                self._refresh_tagged_panel()
+            else:
+                # Tag a new word and compute morphs in the background
+                if not token.is_word:
+                    return
+                token.tagged = True
+                vibe = self.query_one("#vibe-input", Input).value.strip()
+                if vibe:
+                    ctx = self._line_context(token)
+                    self.query_one("#status-bar", Static).update(
+                        f"Tagged: {token.text} — computing morphs…"
+                    )
+                    self._run_add_morph(token.text.lower(), vibe, ctx)
+                self._refresh_tagged_panel()
+            return
+
+        # -- not cycling: normal tag / untag --------------------------------
+        self._ensure_tokenized()
+        token = self._token_at_cursor()
+        if token is None:
+            self.query_one("#status-bar", Static).update(
+                "Place cursor on a word"
+            )
+            return
+
+        token.tagged = not token.tagged
+        verb = "Tagged" if token.tagged else "Untagged"
+        self.query_one("#status-bar", Static).update(f"{verb}: {token.text}")
+        self._refresh_tagged_panel()
+
+    # ---- stop cycling (Escape) -------------------------------------------
+
+    def action_stop_cycling(self) -> None:
+        """Stop cycling — freeze all words at their current candidate."""
+        if self._cycling:
+            self.action_freeze_all()
+
+    # ---- start cycling (F5) ----------------------------------------------
+
+    def action_start_cycling(self) -> None:
+        """Compute morphs for all tagged words, then start the cycle timer."""
+        if self._cycling:
+            return
+
         if not self._model_ready:
             self.query_one("#status-bar", Static).update(
                 "Model still loading…"
@@ -219,67 +407,221 @@ class GhostwriterApp(App):
             )
             return
 
-        self._run_morph(word, vibe)
+        self._ensure_tokenized()
+        tagged = self._tagged_words()
+        if not tagged:
+            self.query_one("#status-bar", Static).update(
+                "Tag some words first (F2)"
+            )
+            return
 
-    @work(thread=True, group="morph")
-    def _run_morph(self, word: str, vibe: str) -> list:
-        from ghostwriter.morph import morph_word
+        words = [t.text.lower() for t in tagged]
+        contexts = [self._line_context(t) for t in tagged]
+        self.query_one("#status-bar", Static).update(
+            f"Computing morphs for {len(words)} words…"
+        )
+        self._run_batch_morph(words, vibe, contexts)
 
-        result = morph_word(word, vibe)
-        return result.candidates  # type: ignore[return-value]
+    @work(thread=True, group="morph_batch")
+    def _run_batch_morph(
+        self, words: list[str], vibe: str, contexts: list[list[str]]
+    ) -> list:
+        from ghostwriter.morph import morph_words
+
+        return morph_words(words, vibe, contexts=contexts)
 
     @on(Worker.StateChanged)
-    def _morph_done(self, event: Worker.StateChanged) -> None:
-        if event.worker.group != "morph":
+    def _batch_morph_done(self, event: Worker.StateChanged) -> None:
+        if event.worker.group != "morph_batch":
             return
         if event.state == WorkerState.SUCCESS:
-            candidates = event.worker.result
-            opt = self.query_one("#candidates", OptionList)
-            opt.clear_options()
-            if not candidates:
-                opt.add_option(Option("(no candidates found)"))
-                return
-            for c in candidates:
-                opt.add_option(
-                    Option(f"{c.word}  ({c.score:.3f})", id=c.word)
+            results = event.worker.result
+            tagged = self._tagged_words()
+
+            for token, morph_result in zip(tagged, results):
+                token.candidates = [c.word for c in morph_result.candidates]
+                token.cycle_index = 0
+                token.locked = False
+
+            # Untag words that got no candidates
+            for t in tagged:
+                if not t.candidates:
+                    t.tagged = False
+
+            active = [t for t in tagged if t.candidates]
+            if not active:
+                self.query_one("#status-bar", Static).update(
+                    "No candidates found for any tagged word"
                 )
+                self._refresh_tagged_panel()
+                return
+
+            self._cycling = True
+            editor = self.query_one("#editor", TextArea)
+            editor.read_only = True
+            editor.load_text(self._rebuild_text())
+            if self._cycle_timer:
+                self._cycle_timer.resume()
+            self.query_one("#status-bar", Static).update(
+                f"Cycling {len(active)} words — F7=lock  F6=freeze  F8=highlight"
+            )
+            self._refresh_tagged_panel()
+
         elif event.state == WorkerState.ERROR:
             self.query_one("#status-bar", Static).update(
                 f"Morph error: {event.worker.error}"
             )
 
-    # ---- accept a candidate ----------------------------------------------
+    # ---- add single word mid-cycle (background morph) --------------------
 
-    @on(OptionList.OptionSelected, "#candidates")
-    def _accept_candidate(self, event: OptionList.OptionSelected) -> None:
-        if self._selected_word is None:
+    @work(thread=True, group="morph_add")
+    def _run_add_morph(self, word_lower: str, vibe: str, context: list[str] | None = None):
+        from ghostwriter.morph import morph_word
+
+        return morph_word(word_lower, vibe, context=context)
+
+    @on(Worker.StateChanged)
+    def _add_morph_done(self, event: Worker.StateChanged) -> None:
+        if event.worker.group != "morph_add":
             return
-        replacement = event.option.id
-        if replacement is None or replacement.startswith("("):
+        if event.state == WorkerState.SUCCESS:
+            result = event.worker.result
+            # Find the matching token (tagged, no candidates yet)
+            for line_tokens in self._poem_tokens:
+                for token in line_tokens:
+                    if (
+                        token.tagged
+                        and not token.candidates
+                        and token.text.lower() == result.original
+                    ):
+                        token.candidates = [
+                            c.word for c in result.candidates
+                        ]
+                        token.cycle_index = 0
+                        token.locked = False
+                        if not token.candidates:
+                            token.tagged = False
+                            self.query_one("#status-bar", Static).update(
+                                f"No candidates for: {token.text}"
+                            )
+                        else:
+                            self.query_one("#status-bar", Static).update(
+                                f"Now cycling: {token.text}"
+                            )
+                        break
+            if self._cycling:
+                self._refresh_editor()
+            self._refresh_tagged_panel()
+        elif event.state == WorkerState.ERROR:
+            self.query_one("#status-bar", Static).update(
+                f"Morph error: {event.worker.error}"
+            )
+
+    # ---- cycling timer ---------------------------------------------------
+
+    def _cycle_tick(self) -> None:
+        """Advance each unlocked tagged word to its next candidate."""
+        if not self._cycling:
+            return
+        changed = False
+        for line_tokens in self._poem_tokens:
+            for token in line_tokens:
+                if token.tagged and not token.locked and token.candidates:
+                    token.cycle_index = (
+                        (token.cycle_index + 1) % len(token.candidates)
+                    )
+                    changed = True
+        if changed:
+            self._refresh_editor()
+            self._refresh_tagged_panel()
+
+    # ---- lock word (F7) --------------------------------------------------
+
+    def action_lock_word(self) -> None:
+        """Lock the cycling word under the cursor at its current replacement."""
+        if not self._cycling:
             return
 
-        original = self._selected_word
+        token = self._token_at_cursor()
+        if token is None or not token.tagged or token.locked:
+            self.query_one("#status-bar", Static).update(
+                "Place cursor on a cycling word"
+            )
+            return
 
-        # Replace in the editor text
-        editor = self.query_one("#editor", TextArea)
-        old_text = editor.text
-
-        # Replace the first occurrence of the selected word (whole-word)
-        pattern = re.compile(r"\b" + re.escape(original) + r"\b")
-        new_text = pattern.sub(replacement, old_text, count=1)
-        editor.load_text(new_text)
-
-        # Track the morph
-        self.morphed[original.lower()] = replacement.lower()
+        token.locked = True
+        self.morphed[token.text.lower()] = token.display.lower()
         self._refresh_morphed_list()
-        self._selected_word = None
-        self.query_one("#word-label", Label).update(
-            "2. place cursor on a word, press [bold]F2[/bold]"
-        )
-        self.query_one("#candidates", OptionList).clear_options()
         self.query_one("#status-bar", Static).update(
-            f"'{original}' → '{replacement}'"
+            f"Locked: {token.text} → {token.display}"
         )
+
+        still_cycling = [
+            t
+            for t in self._tagged_words()
+            if not t.locked and t.candidates
+        ]
+        if not still_cycling:
+            self._finish_cycling()
+        self._refresh_tagged_panel()
+
+    # ---- freeze all (F6) -------------------------------------------------
+
+    def action_freeze_all(self) -> None:
+        """Lock all cycling words at their current replacement and stop."""
+        if not self._cycling:
+            return
+
+        for token in self._tagged_words():
+            if not token.locked and token.candidates:
+                token.locked = True
+                self.morphed[token.text.lower()] = token.display.lower()
+
+        self._refresh_morphed_list()
+        self._finish_cycling()
+
+    def _finish_cycling(self) -> None:
+        """Stop cycling and return to editing mode."""
+        self._cycling = False
+        if self._cycle_timer:
+            self._cycle_timer.pause()
+
+        editor = self.query_one("#editor", TextArea)
+        editor.read_only = False
+        final_text = self._final_text()
+        editor.load_text(final_text)
+
+        self._poem_tokens = []
+        self._tokenized_text = ""
+
+        self.query_one("#status-bar", Static).update(
+            "Frozen — F2 to tag more words, F3 to render PDF"
+        )
+        self._refresh_tagged_panel()
+
+    # ---- side panel ------------------------------------------------------
+
+    def _refresh_tagged_panel(self) -> None:
+        tagged = self._tagged_words()
+        panel = self.query_one("#tagged-list", Static)
+        if not tagged:
+            panel.update("(none)")
+            return
+        lines = []
+        for t in tagged:
+            current = t.display
+            if t.locked:
+                lines.append(f"  {t.text} → [bold green]{current}[/] ✓")
+            elif t.candidates:
+                if self._highlight:
+                    lines.append(
+                        f"  {t.text} → [bold yellow]{current}[/]"
+                    )
+                else:
+                    lines.append(f"  {t.text} → {current}")
+            else:
+                lines.append(f"  {t.text} (waiting…)")
+        panel.update("\n".join(lines))
 
     def _refresh_morphed_list(self) -> None:
         if not self.morphed:
@@ -287,6 +629,17 @@ class GhostwriterApp(App):
             return
         lines = [f"  {k} → {v}" for k, v in self.morphed.items()]
         self.query_one("#morphed-list", Static).update("\n".join(lines))
+
+    # ---- highlight toggle (F8) -------------------------------------------
+
+    def action_toggle_highlight(self) -> None:
+        """Toggle yellow highlighting of cycling words."""
+        self._highlight = not self._highlight
+        state = "on" if self._highlight else "off"
+        self.query_one("#status-bar", Static).update(f"Highlight: {state}")
+        if self._cycling:
+            self._refresh_editor()
+            self._refresh_tagged_panel()
 
     # ---- render / push ---------------------------------------------------
 
@@ -304,7 +657,9 @@ class GhostwriterApp(App):
 
         lines = text.splitlines()
         morphed_set = set(self.morphed.values())
-        path = render_poem(lines, output="ghost.pdf", morphed_words=morphed_set)
+        path = render_poem(
+            lines, output="ghost.pdf", morphed_words=morphed_set
+        )
         return path
 
     @on(Worker.StateChanged)
@@ -312,9 +667,8 @@ class GhostwriterApp(App):
         if event.worker.group != "render":
             return
         if event.state == WorkerState.SUCCESS:
-            path = event.worker.result
             self.query_one("#status-bar", Static).update(
-                f"PDF saved → {path}"
+                f"PDF saved → {event.worker.result}"
             )
         elif event.state == WorkerState.ERROR:
             self.query_one("#status-bar", Static).update(
@@ -348,8 +702,7 @@ class GhostwriterApp(App):
 
     def action_save_poem(self) -> None:
         editor = self.query_one("#editor", TextArea)
-        text = editor.text
-        Path("poem.txt").write_text(text, encoding="utf-8")
+        Path("poem.txt").write_text(editor.text, encoding="utf-8")
         self.query_one("#status-bar", Static).update("Saved → poem.txt")
 
     def action_load_poem(self) -> None:
@@ -362,7 +715,10 @@ class GhostwriterApp(App):
         editor = self.query_one("#editor", TextArea)
         editor.load_text(p.read_text(encoding="utf-8"))
         self.morphed.clear()
+        self._poem_tokens = []
+        self._tokenized_text = ""
         self._refresh_morphed_list()
+        self._refresh_tagged_panel()
         self.query_one("#status-bar", Static).update("Loaded poem.txt")
 
 

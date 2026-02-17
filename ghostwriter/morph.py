@@ -94,12 +94,27 @@ def _ensure_nltk() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _pos_tag_word(word: str) -> str | None:
-    """Return the Penn Treebank POS tag for a single word, or None."""
+def _pos_tag_word(
+    word: str, context: list[str] | None = None
+) -> str | None:
+    """Return the Penn Treebank POS tag for *word*.
+
+    When *context* is provided (list of words from the surrounding line /
+    sentence), the tagger uses it to disambiguate ambiguous words like
+    "understanding" (noun in "a deep understanding" vs. verb in
+    "understanding the problem").
+    """
     try:
         _ensure_nltk()
         from nltk.tag import pos_tag as _pos_tag
 
+        if context:
+            tagged = _pos_tag(context)
+            low = word.lower()
+            for w, tag in tagged:
+                if w.lower() == low:
+                    return tag
+        # Fallback: tag in isolation
         return _pos_tag([word])[0][1]
     except Exception:
         return None
@@ -133,6 +148,29 @@ def _coarse_pos(tag: str | None) -> str | None:
     if tag.startswith("RB"):
         return "adv"
     return None
+
+
+_COARSE_TO_WN: dict[str, str] = {}  # populated on first call
+
+
+def _can_be_pos(word: str, coarse: str) -> bool:
+    """Check if *word* genuinely functions as *coarse* POS via WordNet.
+
+    NLTK's statistical tagger is unreliable on isolated words (e.g. it
+    tags "profound" as NN).  WordNet synset lookup is ground truth:
+    if a word has zero synsets for a given POS it cannot serve that role.
+    """
+    from nltk.corpus import wordnet
+
+    if not _COARSE_TO_WN:
+        _COARSE_TO_WN.update(
+            {"noun": wordnet.NOUN, "verb": wordnet.VERB,
+             "adj": wordnet.ADJ, "adv": wordnet.ADV}
+        )
+    wn_pos = _COARSE_TO_WN.get(coarse)
+    if wn_pos is None:
+        return True
+    return len(wordnet.synsets(word, pos=wn_pos)) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +247,7 @@ def morph_word(
     source_vibe: str | None = None,
     top_n: int = 8,
     model: KeyedVectors | None = None,
+    context: list[str] | None = None,
 ) -> MorphResult:
     """Shift *word* toward *target_vibe*, returning drop-in replacements.
 
@@ -224,6 +263,10 @@ def morph_word(
         How many candidates to return.
     model:
         Pre-loaded KeyedVectors; uses the global singleton when *None*.
+    context:
+        Words from the surrounding line / sentence.  Passed to the POS
+        tagger so that ambiguous words like "understanding" are tagged
+        correctly based on how they are actually used.
 
     Returns
     -------
@@ -241,7 +284,7 @@ def morph_word(
         return result
 
     # -- POS & lemma --------------------------------------------------------
-    ptb_tag = _pos_tag_word(low)
+    ptb_tag = _pos_tag_word(low, context=context)
     wn_pos = _ptb_to_wordnet(ptb_tag) if ptb_tag else None
     coarse = _coarse_pos(ptb_tag)
     lemma = _lemmatize(low, wn_pos) if wn_pos else low
@@ -257,9 +300,16 @@ def morph_word(
     # -- Candidate pool (base-form words) -----------------------------------
     pool: set[str] = set()
 
-    # Source 1: WordNet synonyms (already same-POS by construction)
+    # Source 1: WordNet synonyms — POS-filtered to catch cross-POS leaks
+    # from the one-hop expansion (hypernyms / similar-tos).
     if wn_pos:
-        pool |= _wordnet_synonyms(lemma, wn_pos)
+        wn_cands = _wordnet_synonyms(lemma, wn_pos)
+        if coarse:
+            wn_cands = {
+                w for w in wn_cands
+                if _coarse_pos(_pos_tag_word(w)) == coarse
+            }
+        pool |= wn_cands
 
     # Source 2: embedding neighbours via vector arithmetic
     positive = [low, vibe_low]
@@ -297,6 +347,10 @@ def morph_word(
     for cand in pool:
         if not _in_vocab(model, cand):
             continue
+        # WordNet cross-check: reject words that cannot genuinely serve
+        # the target POS (catches NLTK tagger errors on isolated words).
+        if coarse and not _can_be_pos(cand, coarse):
+            continue
         cand_vec = model[cand].astype(np.float64)
         cand_norm = np.linalg.norm(cand_vec)
         if cand_norm == 0:
@@ -328,10 +382,21 @@ def morph_words(
     target_vibe: str,
     source_vibe: str | None = None,
     top_n: int = 8,
+    contexts: list[list[str]] | None = None,
 ) -> list[MorphResult]:
-    """Morph several words in one call (shares the loaded model)."""
+    """Morph several words in one call (shares the loaded model).
+
+    *contexts*, when provided, should be a list of word-lists — one per
+    entry in *words* — giving the surrounding line so the POS tagger can
+    disambiguate.
+    """
     model = load_model()
+    if contexts is None:
+        contexts = [None] * len(words)  # type: ignore[list-item]
     return [
-        morph_word(w, target_vibe, source_vibe, top_n=top_n, model=model)
-        for w in words
+        morph_word(
+            w, target_vibe, source_vibe,
+            top_n=top_n, model=model, context=ctx,
+        )
+        for w, ctx in zip(words, contexts)
     ]
