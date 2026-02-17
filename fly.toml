@@ -1,0 +1,41 @@
+# Fly.io config — https://fly.io/docs/reference/configuration/
+#
+# After installing flyctl:
+#   fly launch --copy-config        (creates the app, keep this fly.toml)
+#   fly volumes create ghostwriter_data --region sjc --size 1
+#   fly secrets set GHOSTWRITER_API_KEY="$(openssl rand -hex 16)"
+#   fly deploy
+#
+# Then point DNS:
+#   fly certs add ghostwriter.humble.audio
+#   Add CNAME:  ghostwriter.humble.audio -> <app-name>.fly.dev
+
+app = "ghostwriter-hslwiq"
+primary_region = "sjc"
+
+[build]
+
+[env]
+  GHOSTWRITER_POEMS_DIR = "/data/poems"
+  GENSIM_DATA_DIR = "/data/gensim-data"
+
+[http_service]
+  internal_port = 5000
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [http_service.concurrency]
+    type = "requests"
+    hard_limit = 25
+    soft_limit = 20
+
+[[vm]]
+  memory = "1gb"
+  cpu_kind = "shared"
+  cpus = 1
+
+[mounts]
+  source = "ghostwriter_data"
+  destination = "/data"

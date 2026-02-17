@@ -712,23 +712,33 @@ class GhostwriterApp(App):
 
     @work(thread=True, group="share")
     def _do_share(self, text: str) -> str:
+        import hashlib
+        import time
         import webbrowser
-        from ghostwriter.web import render_poem_html, save_html, start_server
+
+        from ghostwriter.web import render_poem_html, start_server
 
         page = render_poem_html(text, morphed=dict(self.morphed))
-        save_html(page, "poem.html")
+
+        poems_dir = Path("poems")
+        poems_dir.mkdir(parents=True, exist_ok=True)
+        poem_id = hashlib.sha256(
+            f"{time.time():.6f}{text[:100]}".encode()
+        ).hexdigest()[:8]
+        save_path = poems_dir / f"{poem_id}.html"
+        save_path.write_text(page, encoding="utf-8")
+
         url = start_server(page)
         webbrowser.open(url)
-        return url
+        return f"{url}  (poems/{poem_id}.html)"
 
     @on(Worker.StateChanged)
     def _share_done(self, event: Worker.StateChanged) -> None:
         if event.worker.group != "share":
             return
         if event.state == WorkerState.SUCCESS:
-            url = event.worker.result
             self.query_one("#status-bar", Static).update(
-                f"Sharing → {url}  (saved poem.html)"
+                f"Shared → {event.worker.result}"
             )
         elif event.state == WorkerState.ERROR:
             self.query_one("#status-bar", Static).update(

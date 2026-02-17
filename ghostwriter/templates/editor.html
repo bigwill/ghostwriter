@@ -1,0 +1,757 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>ghostwriter</title>
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1f47b;</text></svg>">
+
+<style>
+*,*::before,*::after { margin:0; padding:0; box-sizing:border-box; }
+
+:root {
+  --bg:      #faf8f5;
+  --fg:      #2c2c2c;
+  --muted:   #b0a090;
+  --ghost:   rgba(0,0,0,0.08);
+  --accent:  #7a4e2d;
+  --tag-bg:  rgba(122,78,45,0.10);
+  --tag-bdr: rgba(122,78,45,0.35);
+  --danger:  #a04040;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg:      #1a1916;
+    --fg:      #e0dbd4;
+    --muted:   #6e6358;
+    --ghost:   rgba(255,255,255,0.08);
+    --accent:  #c9a57a;
+    --tag-bg:  rgba(201,165,122,0.12);
+    --tag-bdr: rgba(201,165,122,0.35);
+    --danger:  #c06060;
+  }
+}
+
+html { height:100%; }
+
+body {
+  font-family: Georgia, 'Times New Roman', 'Noto Serif', serif;
+  background: var(--bg);
+  color: var(--fg);
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 2rem 1.25rem 3rem;
+  -webkit-font-smoothing: antialiased;
+}
+
+.container { max-width: 40em; width: 100%; }
+
+/* ---- header ---- */
+.brand {
+  font-variant: small-caps;
+  letter-spacing: 0.18em;
+  color: var(--muted);
+  font-size: 0.75rem;
+  text-align: center;
+  margin-bottom: 0.5rem;
+}
+.brand a { color: inherit; text-decoration: none; }
+
+#status {
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-style: italic;
+  margin-bottom: 1.5rem;
+  min-height: 1.2em;
+  transition: opacity 0.3s;
+}
+#status.ready { opacity: 0; pointer-events: none; height: 0; min-height: 0; margin: 0; }
+
+/* ---- steps ---- */
+.step { display: none; }
+.step.active { display: block; }
+
+/* ---- textarea ---- */
+textarea {
+  width: 100%;
+  min-height: 45vh;
+  font-family: inherit;
+  font-size: 1.1rem;
+  line-height: 1.9;
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid var(--ghost);
+  border-radius: 6px;
+  padding: 1.25rem;
+  resize: vertical;
+  transition: border-color 0.2s;
+}
+textarea:focus { outline: none; border-color: var(--accent); }
+textarea::placeholder { color: var(--muted); }
+
+/* ---- inputs & buttons ---- */
+.field {
+  margin: 1rem 0;
+}
+input[type="text"] {
+  width: 100%;
+  font-family: inherit;
+  font-size: 1rem;
+  padding: 0.65rem 1rem;
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid var(--ghost);
+  border-radius: 6px;
+  transition: border-color 0.2s;
+}
+input:focus { outline: none; border-color: var(--accent); }
+input::placeholder { color: var(--muted); }
+
+.actions {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  margin-top: 1.25rem;
+  flex-wrap: wrap;
+}
+.spacer { flex: 1; }
+
+button {
+  font-family: inherit;
+  font-size: 0.9rem;
+  padding: 0.6rem 1.3rem;
+  background: var(--accent);
+  color: var(--bg);
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: opacity 0.2s;
+  -webkit-tap-highlight-color: transparent;
+}
+button:active { opacity: 0.8; }
+button:disabled { opacity: 0.4; cursor: default; }
+
+.ghost-btn {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--ghost);
+  font-size: 0.85rem;
+  padding: 0.5rem 1rem;
+}
+.ghost-btn:active { background: var(--ghost); }
+
+.muted-text {
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-style: italic;
+}
+
+/* ---- poem words (tagging view) ---- */
+.poem-words {
+  font-size: 1.1rem;
+  line-height: 2.2;
+  padding: 0.75rem 0;
+}
+.poem-line { min-height: 1.4em; }
+.blank-line { height: 1.8em; }
+
+.word {
+  cursor: pointer;
+  padding: 0.12em 0.15em;
+  border-radius: 4px;
+  transition: all 0.15s;
+  -webkit-tap-highlight-color: transparent;
+}
+.word:hover { background: var(--tag-bg); }
+.word.tagged {
+  background: var(--tag-bg);
+  border-bottom: 2px solid var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* ---- morph results ---- */
+.morphed-word {
+  color: var(--accent);
+  cursor: pointer;
+  border-bottom: 1px dotted var(--tag-bdr);
+  padding: 0.1em 0;
+  transition: background 0.15s;
+  -webkit-tap-highlight-color: transparent;
+}
+.morphed-word:hover,
+.morphed-word:active {
+  background: var(--tag-bg);
+}
+
+/* ---- alternatives overlay ---- */
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.35);
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  z-index: 100;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s;
+}
+.overlay.open {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.alt-panel {
+  background: var(--bg);
+  border-radius: 16px 16px 0 0;
+  padding: 1.5rem 1.5rem 2rem;
+  width: 100%;
+  max-width: 40em;
+  max-height: 60vh;
+  overflow-y: auto;
+  transform: translateY(100%);
+  transition: transform 0.25s ease-out;
+}
+.overlay.open .alt-panel {
+  transform: translateY(0);
+}
+
+.alt-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 1rem;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid var(--ghost);
+}
+.alt-original {
+  color: var(--muted);
+  font-size: 0.85rem;
+  font-style: italic;
+}
+.alt-close {
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 1.2rem;
+  cursor: pointer;
+  padding: 0.3rem;
+}
+
+.alt-options {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+.alt-opt {
+  display: block;
+  width: 100%;
+  text-align: left;
+  font-family: inherit;
+  font-size: 1.05rem;
+  padding: 0.7rem 1rem;
+  background: transparent;
+  color: var(--fg);
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.alt-opt:hover,
+.alt-opt:active { background: var(--tag-bg); }
+.alt-opt.selected {
+  color: var(--accent);
+  font-weight: 600;
+  background: var(--tag-bg);
+}
+.alt-score {
+  float: right;
+  font-size: 0.75rem;
+  color: var(--muted);
+  font-weight: normal;
+}
+
+/* ---- share result ---- */
+.share-result { margin-top: 1.25rem; }
+.url-box {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.65rem 1rem;
+  background: var(--ghost);
+  border-radius: 8px;
+}
+.url-box a {
+  flex: 1;
+  color: var(--accent);
+  font-family: monospace;
+  font-size: 0.85rem;
+  text-decoration: none;
+  word-break: break-all;
+}
+.url-box button {
+  font-size: 0.8rem;
+  padding: 0.35rem 0.75rem;
+}
+
+/* ---- nav ---- */
+.nav {
+  text-align: center;
+  margin-top: 2.5rem;
+  font-size: 0.8rem;
+}
+.nav a { color: var(--muted); text-decoration: none; }
+.nav a:hover { text-decoration: underline; }
+
+/* ---- responsive ---- */
+@media (max-width: 480px) {
+  body { padding: 1.5rem 1rem 2.5rem; }
+  textarea { min-height: 35vh; font-size: 1rem; padding: 1rem; }
+  .poem-words { font-size: 1rem; line-height: 2; }
+}
+
+/* ---- loading spinner ---- */
+@keyframes pulse { 0%,100% { opacity:0.4; } 50% { opacity:1; } }
+.loading { animation: pulse 1.5s ease-in-out infinite; }
+</style>
+</head>
+<body>
+
+<div class="container">
+
+  <p class="brand"><a href="/">ghostwriter</a></p>
+  <div id="status" class="loading">loading word embeddings...</div>
+
+  <!-- ======================= Step 1: Write ======================= -->
+  <section id="step-write" class="step active">
+    <textarea id="poem-text" placeholder="write or paste a poem..." autofocus></textarea>
+    <div class="field">
+      <input id="vibe-input" type="text" placeholder="vibe -- e.g. dread, warmth, alien">
+    </div>
+    <div class="actions">
+      <span class="spacer"></span>
+      <button id="btn-prepare" onclick="prepare()" disabled>tag words</button>
+    </div>
+  </section>
+
+  <!-- ======================= Step 2: Tag ========================= -->
+  <section id="step-tag" class="step">
+    <p class="muted-text" style="margin-bottom:0.5rem">tap words to tag them for morphing</p>
+    <div id="poem-words" class="poem-words"></div>
+    <div class="actions">
+      <button class="ghost-btn" onclick="backToWrite()">edit</button>
+      <span class="spacer"></span>
+      <span id="tag-count" class="muted-text"></span>
+      <button id="btn-morph" onclick="doMorph()" disabled>morph</button>
+    </div>
+  </section>
+
+  <!-- ======================= Step 3: Result ====================== -->
+  <section id="step-result" class="step">
+    <div id="result-poem" class="poem-words"></div>
+    <div class="actions">
+      <button class="ghost-btn" onclick="backToTag()">re-tag</button>
+      <span class="spacer"></span>
+      <button id="btn-save" onclick="savePoem()">save & share</button>
+    </div>
+    <div id="share-result" class="share-result" style="display:none">
+      <div class="url-box">
+        <a id="share-link" href="#" target="_blank"></a>
+        <button onclick="copyUrl()">copy</button>
+      </div>
+    </div>
+  </section>
+
+  <nav class="nav"><a href="/poems">poem gallery</a></nav>
+</div>
+
+<!-- ======================= Alternatives overlay ================== -->
+<div id="alt-overlay" class="overlay" onclick="closeAlts(event)">
+  <div class="alt-panel" onclick="event.stopPropagation()">
+    <div class="alt-header">
+      <span id="alt-original" class="alt-original"></span>
+      <button class="alt-close" onclick="closeAlts()">&times;</button>
+    </div>
+    <div id="alt-options" class="alt-options"></div>
+  </div>
+</div>
+
+<script>
+// =====================================================================
+// State
+// =====================================================================
+const WORD_RE = /[A-Za-z]+/g;
+const API_KEY = {{ api_key | default('', true) | tojson }};
+
+function apiHeaders() {
+  const h = {'Content-Type': 'application/json'};
+  if (API_KEY) h['X-Api-Key'] = API_KEY;
+  return h;
+}
+
+let poemLines = [];    // [{tokens: [{text, isWord, tagged, idx}]}]
+let nextIdx = 0;
+let morphData = {};    // idx -> {original, candidates, selectedIdx}
+let currentMorphed = {}; // {originalLower: replacementLower}
+let altTarget = null;  // idx of word showing alternatives
+
+// =====================================================================
+// Helpers
+// =====================================================================
+
+function showStep(name) {
+  document.querySelectorAll('.step').forEach(el => el.classList.remove('active'));
+  document.getElementById('step-' + name).classList.add('active');
+}
+
+function matchCase(original, replacement) {
+  if (!original || !replacement) return replacement;
+  if (original === original.toUpperCase() && original.length > 1)
+    return replacement.toUpperCase();
+  if (original[0] === original[0].toUpperCase())
+    return replacement[0].toUpperCase() + replacement.slice(1);
+  return replacement;
+}
+
+function tokenizeLine(line) {
+  const tokens = [];
+  let last = 0;
+  const re = /[A-Za-z]+/g;
+  let m;
+  while ((m = re.exec(line)) !== null) {
+    if (m.index > last)
+      tokens.push({text: line.slice(last, m.index), isWord: false});
+    tokens.push({text: m[0], isWord: true, tagged: false, idx: nextIdx++});
+    last = m.index + m[0].length;
+  }
+  if (last < line.length)
+    tokens.push({text: line.slice(last), isWord: false});
+  return tokens;
+}
+
+function getLineContext(line) {
+  return line.tokens.filter(t => t.isWord).map(t => t.text.toLowerCase());
+}
+
+function getAllTagged() {
+  const out = [];
+  poemLines.forEach(line => {
+    line.tokens.forEach(tok => { if (tok.isWord && tok.tagged) out.push(tok); });
+  });
+  return out;
+}
+
+// =====================================================================
+// Status polling
+// =====================================================================
+
+function pollStatus() {
+  fetch('/api/status')
+    .then(r => r.json())
+    .then(data => {
+      const el = document.getElementById('status');
+      if (data.model_ready) {
+        el.textContent = 'ready';
+        el.classList.remove('loading');
+        el.classList.add('ready');
+        document.getElementById('btn-prepare').disabled = false;
+      } else {
+        setTimeout(pollStatus, 2000);
+      }
+    })
+    .catch(() => setTimeout(pollStatus, 3000));
+}
+pollStatus();
+
+// =====================================================================
+// Step 1 -> Step 2: Prepare tagging
+// =====================================================================
+
+function prepare() {
+  const text = document.getElementById('poem-text').value;
+  const vibe = document.getElementById('vibe-input').value.trim();
+  if (!text.trim()) return;
+  if (!vibe) {
+    const inp = document.getElementById('vibe-input');
+    inp.focus();
+    inp.style.borderColor = 'var(--danger)';
+    setTimeout(() => inp.style.borderColor = '', 1500);
+    return;
+  }
+
+  nextIdx = 0;
+  poemLines = text.split('\n').map(line => ({tokens: tokenizeLine(line)}));
+  renderTagView();
+  showStep('tag');
+}
+
+function renderTagView() {
+  const container = document.getElementById('poem-words');
+  container.innerHTML = '';
+
+  poemLines.forEach(line => {
+    if (line.tokens.length === 0 || (line.tokens.length === 1 && !line.tokens[0].text.trim())) {
+      const div = document.createElement('div');
+      div.className = 'blank-line';
+      container.appendChild(div);
+      return;
+    }
+
+    const div = document.createElement('div');
+    div.className = 'poem-line';
+
+    line.tokens.forEach(tok => {
+      if (tok.isWord) {
+        const span = document.createElement('span');
+        span.className = 'word' + (tok.tagged ? ' tagged' : '');
+        span.textContent = tok.text;
+        span.dataset.idx = tok.idx;
+        span.addEventListener('click', () => {
+          tok.tagged = !tok.tagged;
+          span.classList.toggle('tagged');
+          updateTagCount();
+        });
+        div.appendChild(span);
+      } else {
+        div.appendChild(document.createTextNode(tok.text));
+      }
+    });
+
+    container.appendChild(div);
+  });
+
+  updateTagCount();
+}
+
+function updateTagCount() {
+  const tagged = getAllTagged();
+  const el = document.getElementById('tag-count');
+  el.textContent = tagged.length ? tagged.length + ' tagged' : '';
+  document.getElementById('btn-morph').disabled = tagged.length === 0;
+}
+
+function backToWrite() {
+  showStep('write');
+}
+
+// =====================================================================
+// Step 2 -> Step 3: Morph
+// =====================================================================
+
+function doMorph() {
+  const vibe = document.getElementById('vibe-input').value.trim();
+  const tagged = getAllTagged();
+  if (!tagged.length || !vibe) return;
+
+  const words = tagged.map(tok => {
+    const line = poemLines.find(l => l.tokens.includes(tok));
+    return {
+      word: tok.text.toLowerCase(),
+      context: line ? getLineContext(line) : [],
+    };
+  });
+
+  const btn = document.getElementById('btn-morph');
+  btn.disabled = true;
+  btn.textContent = 'morphing...';
+
+  fetch('/api/morph', {
+    method: 'POST',
+    headers: apiHeaders(),
+    body: JSON.stringify({vibe, words}),
+  })
+  .then(r => {
+    if (!r.ok) throw new Error('Server returned ' + r.status);
+    return r.json();
+  })
+  .then(data => {
+    if (data.error) { alert(data.error); return; }
+
+    morphData = {};
+    currentMorphed = {};
+
+    data.results.forEach((result, i) => {
+      const tok = tagged[i];
+      morphData[tok.idx] = {
+        original: tok.text,
+        originalLower: result.original,
+        candidates: result.candidates,
+        selectedIdx: result.candidates.length > 0 ? 0 : -1,
+      };
+      if (result.candidates.length > 0) {
+        currentMorphed[result.original] = result.candidates[0].word;
+      }
+    });
+
+    renderResult();
+    showStep('result');
+  })
+  .catch(err => alert('Morph failed: ' + err.message))
+  .finally(() => {
+    btn.disabled = false;
+    btn.textContent = 'morph';
+  });
+}
+
+// =====================================================================
+// Step 3: Render results
+// =====================================================================
+
+function renderResult() {
+  const container = document.getElementById('result-poem');
+  container.innerHTML = '';
+
+  poemLines.forEach(line => {
+    if (line.tokens.length === 0 || (line.tokens.length === 1 && !line.tokens[0].text.trim())) {
+      const div = document.createElement('div');
+      div.className = 'blank-line';
+      container.appendChild(div);
+      return;
+    }
+
+    const div = document.createElement('div');
+    div.className = 'poem-line';
+
+    line.tokens.forEach(tok => {
+      const md = morphData[tok.idx];
+      if (md && md.selectedIdx >= 0) {
+        const cand = md.candidates[md.selectedIdx].word;
+        const display = matchCase(md.original, cand);
+        const span = document.createElement('span');
+        span.className = 'morphed-word';
+        span.textContent = display;
+        span.title = 'was: ' + md.original;
+        span.dataset.idx = tok.idx;
+        span.addEventListener('click', () => showAlts(tok.idx));
+        div.appendChild(span);
+      } else {
+        div.appendChild(document.createTextNode(tok.text));
+      }
+    });
+
+    container.appendChild(div);
+  });
+
+  document.getElementById('share-result').style.display = 'none';
+}
+
+// =====================================================================
+// Alternatives overlay
+// =====================================================================
+
+function showAlts(idx) {
+  altTarget = idx;
+  const md = morphData[idx];
+  if (!md) return;
+
+  document.getElementById('alt-original').textContent = 'was: ' + md.original;
+  const container = document.getElementById('alt-options');
+  container.innerHTML = '';
+
+  md.candidates.forEach((c, i) => {
+    const btn = document.createElement('button');
+    btn.className = 'alt-opt' + (i === md.selectedIdx ? ' selected' : '');
+    const display = matchCase(md.original, c.word);
+    btn.innerHTML = display + '<span class="alt-score">' + c.score.toFixed(3) + '</span>';
+    btn.addEventListener('click', () => selectAlt(idx, i));
+    container.appendChild(btn);
+  });
+
+  document.getElementById('alt-overlay').classList.add('open');
+}
+
+function selectAlt(idx, candidateIdx) {
+  const md = morphData[idx];
+  md.selectedIdx = candidateIdx;
+  currentMorphed[md.originalLower] = md.candidates[candidateIdx].word;
+  closeAlts();
+  renderResult();
+}
+
+function closeAlts(e) {
+  if (e && e.target !== document.getElementById('alt-overlay')) return;
+  document.getElementById('alt-overlay').classList.remove('open');
+  altTarget = null;
+}
+
+function backToTag() {
+  showStep('tag');
+  renderTagView();
+}
+
+// =====================================================================
+// Save & Share
+// =====================================================================
+
+function buildFinalText() {
+  let text = '';
+  poemLines.forEach((line, li) => {
+    if (li > 0) text += '\n';
+    line.tokens.forEach(tok => {
+      const md = morphData[tok.idx];
+      if (md && md.selectedIdx >= 0) {
+        text += matchCase(md.original, md.candidates[md.selectedIdx].word);
+      } else {
+        text += tok.text;
+      }
+    });
+  });
+  return text;
+}
+
+function savePoem() {
+  const text = buildFinalText();
+  const btn = document.getElementById('btn-save');
+  btn.disabled = true;
+  btn.textContent = 'saving...';
+
+  fetch('/api/save', {
+    method: 'POST',
+    headers: apiHeaders(),
+    body: JSON.stringify({text, morphed: currentMorphed}),
+  })
+  .then(r => r.json())
+  .then(data => {
+    const shareDiv = document.getElementById('share-result');
+    shareDiv.style.display = 'block';
+    const link = document.getElementById('share-link');
+    link.href = data.url;
+    link.textContent = data.full_url;
+    link.dataset.url = data.full_url;
+  })
+  .catch(err => alert('Save failed: ' + err.message))
+  .finally(() => {
+    btn.disabled = false;
+    btn.textContent = 'save & share';
+  });
+}
+
+function copyUrl() {
+  const url = document.getElementById('share-link').dataset.url;
+  if (navigator.clipboard) {
+    navigator.clipboard.writeText(url).then(() => {
+      const btn = event.target;
+      const orig = btn.textContent;
+      btn.textContent = 'copied!';
+      setTimeout(() => btn.textContent = orig, 2000);
+    });
+  } else {
+    // Fallback
+    const ta = document.createElement('textarea');
+    ta.value = url;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+  }
+}
+</script>
+</body>
+</html>

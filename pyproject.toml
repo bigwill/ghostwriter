@@ -16,10 +16,15 @@ dependencies = [
     "dpt-rp1-py>=0.1.16",
     "nltk>=3.8",
     "lemminflect>=0.2.3",
+    "flask>=3.0",
 ]
 
 [project.scripts]
 ghostwriter = "ghostwriter.app:main"
+ghostwriter-web = "ghostwriter.server:main"
 
 [tool.setuptools.packages.find]
 include = ["ghostwriter*"]
+
+[tool.setuptools.package-data]
+ghostwriter = ["templates/*.html"]
