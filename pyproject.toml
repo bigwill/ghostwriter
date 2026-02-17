@@ -17,6 +17,7 @@ dependencies = [
     "nltk>=3.8",
     "lemminflect>=0.2.3",
     "flask>=3.0",
+    "Pillow>=10.0",
 ]
 
 [project.scripts]

@@ -32,11 +32,14 @@ _TEMPLATE = """\
 <meta property="og:type" content="article">
 <meta property="og:title" content="{og_title}">
 <meta property="og:description" content="{og_description}">
-<meta property="og:site_name" content="Ghostwriter">
+<meta property="og:site_name" content="ghostwriter">
 {og_url_tag}
-<meta name="twitter:card" content="summary">
+{og_image_tag}
+<meta name="description" content="{og_description}">
+<meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="{og_title}">
 <meta name="twitter:description" content="{og_description}">
+{twitter_image_tag}
 
 <link rel="icon" href="data:image/svg+xml,\
 <svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'>\
@@ -96,8 +99,11 @@ body {{
   color: var(--accent);
   position: relative;
   cursor: default;
-  transition: color 0.2s;
   border-bottom: 1px dotted var(--ghost);
+  transition: opacity 0.35s ease;
+}}
+.morphed.fading {{
+  opacity: 0;
 }}
 .morphed::after {{
   content: attr(data-original);
@@ -154,6 +160,51 @@ document.querySelectorAll('.morphed').forEach(function(el) {{
     el.classList.toggle('reveal');
   }});
 }});
+
+// Cycle through alternative words every 3 seconds (random per word)
+(function() {{
+  var cyclers = document.querySelectorAll('.morphed.cycling');
+  if (!cyclers.length) return;
+  cyclers.forEach(function(el) {{ el._ci = 0; }});
+  function applyCase(word, caseType) {{
+    if (caseType === 'upper') return word.toUpperCase();
+    if (caseType === 'title') return word[0].toUpperCase() + word.slice(1);
+    return word;
+  }}
+  function adjustArticle(el, rawWord) {{
+    var prev = el.previousSibling;
+    if (!prev || prev.nodeType !== 3) return;
+    var t = prev.textContent;
+    var vowel = 'aeiou'.indexOf(rawWord[0].toLowerCase()) >= 0;
+    var fixed = t.replace(/(^|\s)(a|an|A|An|AN)\s$/, function(m, pre, art) {{
+      var target = vowel ? 'an' : 'a';
+      if (art === art.toUpperCase() && art.length > 1) target = target.toUpperCase();
+      else if (art[0] === art[0].toUpperCase()) target = target[0].toUpperCase() + target.slice(1);
+      return pre + target + ' ';
+    }});
+    if (fixed !== t) prev.textContent = fixed;
+  }}
+  setInterval(function() {{
+    cyclers.forEach(function(el) {{
+      var words;
+      try {{ words = JSON.parse(el.getAttribute('data-words')); }}
+      catch(e) {{ return; }}
+      if (!words || words.length <= 1) return;
+      var caseType = el.getAttribute('data-case') || 'lower';
+      var cur = el._ci || 0;
+      var next = Math.floor(Math.random() * (words.length - 1));
+      if (next >= cur) next++;
+      el._ci = next;
+      var w = applyCase(words[next], caseType);
+      el.classList.add('fading');
+      setTimeout(function() {{
+        el.textContent = w;
+        adjustArticle(el, words[next]);
+        el.classList.remove('fading');
+      }}, 350);
+    }});
+  }}, 3000);
+}})();
 </script>
 </body>
 </html>
@@ -165,12 +216,28 @@ document.querySelectorAll('.morphed').forEach(function(el) {{
 # ---------------------------------------------------------------------------
 
 
-def _poem_to_html(text: str, morphed: dict[str, str]) -> str:
-    """Convert poem text to HTML with morphed words wrapped in spans."""
-    # Build reverse lookup: replacement_lower -> original_lower
-    repl_to_orig: dict[str, str] = {}
+def _poem_to_html(text: str, morphed: dict[str, str | list[str]]) -> str:
+    """Convert poem text to HTML with morphed words wrapped in spans.
+
+    *morphed* values can be a single replacement string or a list of
+    cycling words.  When a list is provided the first word is shown
+    initially and the rest cycle via client-side JS.
+    """
+    import json as _json
+
+    # Normalise: ensure every value is a list
+    norm: dict[str, list[str]] = {}
     for orig, repl in morphed.items():
-        repl_to_orig[repl.lower()] = orig.lower()
+        if isinstance(repl, str):
+            norm[orig.lower()] = [repl]
+        else:
+            norm[orig.lower()] = list(repl)
+
+    # Build reverse lookup: first_replacement_lower -> (original_lower, all_words)
+    repl_to_orig: dict[str, tuple[str, list[str]]] = {}
+    for orig, words in norm.items():
+        if words:
+            repl_to_orig[words[0].lower()] = (orig, words)
 
     lines_html: list[str] = []
     for line in text.splitlines():
@@ -180,15 +247,26 @@ def _poem_to_html(text: str, morphed: dict[str, str]) -> str:
         parts: list[str] = []
         last = 0
         for m in _WORD_RE.finditer(line):
-            # Non-word text before this match
             if m.start() > last:
                 parts.append(_esc.escape(line[last : m.start()]))
             word = m.group()
-            original = repl_to_orig.get(word.lower())
-            if original:
+            entry = repl_to_orig.get(word.lower())
+            if entry:
+                original, all_words = entry
+                words_json = _esc.escape(_json.dumps(all_words))
+                cls = "morphed cycling" if len(all_words) > 1 else "morphed"
+                # Detect case pattern from the word as it appears in the poem
+                if word == word.upper() and len(word) > 1:
+                    case = "upper"
+                elif word[0].isupper():
+                    case = "title"
+                else:
+                    case = "lower"
                 parts.append(
-                    f'<span class="morphed" data-original='
-                    f'"{_esc.escape(original)}">'
+                    f'<span class="{cls}"'
+                    f' data-original="{_esc.escape(original)}"'
+                    f' data-case="{case}"'
+                    f" data-words='{words_json}'>"
                     f"{_esc.escape(word)}</span>"
                 )
             else:
@@ -202,7 +280,7 @@ def _poem_to_html(text: str, morphed: dict[str, str]) -> str:
 
 def render_poem_html(
     text: str,
-    morphed: dict[str, str] | None = None,
+    morphed: dict[str, str | list[str]] | None = None,
     title: str | None = None,
     base_url: str | None = None,
 ) -> str:
@@ -213,8 +291,9 @@ def render_poem_html(
     text:
         The final poem text (after morphing).
     morphed:
-        ``{original_word: replacement_word}`` mapping.  Replacement words
-        are highlighted in the output and show the original on hover.
+        ``{original_word: replacement_word}`` or
+        ``{original_word: [word1, word2, ...]}`` mapping.  When a list
+        is provided, the shared page cycles through them every 3 s.
     title:
         Page ``<title>`` and OG title.  Defaults to the first line.
     base_url:
@@ -226,11 +305,34 @@ def render_poem_html(
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     if not title:
         title = lines[0][:80] if lines else "A Poem"
-    og_desc = " / ".join(lines[:3])[:200] if lines else ""
+    # Use newline-separated lines for a readable preview
+    og_desc = " \u2022 ".join(lines[:4])[:200] if lines else ""
 
+    # Always use https for OG URL
     og_url_tag = ""
     if base_url:
-        og_url_tag = f'<meta property="og:url" content="{_esc.escape(base_url)}">'
+        secure_url = base_url.replace("http://", "https://", 1)
+        og_url_tag = (
+            f'<meta property="og:url" content="{_esc.escape(secure_url)}">'
+        )
+
+    # OG image — use the poem-specific OG image endpoint if we have a URL
+    og_image_tag = ""
+    twitter_image_tag = ""
+    if base_url:
+        # Extract poem_id from the URL path /p/<id>
+        _id_match = re.search(r"/p/([a-f0-9]+)", base_url)
+        if _id_match:
+            img_base = base_url.replace("http://", "https://", 1)
+            img_url = img_base.rsplit("/p/", 1)[0] + "/og/" + _id_match.group(1) + ".png"
+            og_image_tag = (
+                f'<meta property="og:image" content="{_esc.escape(img_url)}">\n'
+                f'<meta property="og:image:width" content="1200">\n'
+                f'<meta property="og:image:height" content="630">'
+            )
+            twitter_image_tag = (
+                f'<meta name="twitter:image" content="{_esc.escape(img_url)}">'
+            )
 
     poem_html = _poem_to_html(text, morphed)
 
@@ -239,6 +341,8 @@ def render_poem_html(
         og_title=_esc.escape(title),
         og_description=_esc.escape(og_desc),
         og_url_tag=og_url_tag,
+        og_image_tag=og_image_tag,
+        twitter_image_tag=twitter_image_tag,
         poem_html=poem_html,
     )
 

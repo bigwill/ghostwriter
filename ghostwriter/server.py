@@ -13,6 +13,7 @@ Environment variables:
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
 import socket
@@ -21,6 +22,9 @@ import time
 from pathlib import Path
 
 from flask import Flask, abort, jsonify, render_template, request
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+log = logging.getLogger("ghostwriter")
 
 # ---------------------------------------------------------------------------
 # Config
@@ -55,12 +59,22 @@ def _require_api_key() -> None:
 _model_ready = False
 
 
-def _preload() -> None:
-    global _model_ready
-    from ghostwriter.morph import load_model
+_preload_error: str | None = None
 
-    load_model()
-    _model_ready = True
+
+def _preload() -> None:
+    global _model_ready, _preload_error
+    try:
+        log.info("PRELOAD: starting gensim import...")
+        from ghostwriter.morph import load_model
+
+        log.info("PRELOAD: gensim imported, loading model...")
+        load_model()
+        _model_ready = True
+        log.info("PRELOAD: model ready!")
+    except Exception as e:
+        _preload_error = str(e)
+        log.exception("PRELOAD ERROR: %s", e)
 
 
 threading.Thread(target=_preload, daemon=True).start()
@@ -112,6 +126,162 @@ def view_poem(poem_id: str):
     return path.read_text(encoding="utf-8")
 
 
+@app.route("/og/<poem_id>.png")
+def og_image(poem_id: str):
+    """Generate a 1200x630 OG image (PNG) for iMessage / social previews."""
+    import html as _html_mod
+    import io
+
+    if not re.fullmatch(r"[a-f0-9]{8}", poem_id):
+        return "Not found", 404
+    path = POEMS_DIR / f"{poem_id}.html"
+    if not path.exists():
+        return "Not found", 404
+
+    content = path.read_text(encoding="utf-8")
+    title_m = re.search(r"<title>(.*?)</title>", content)
+    title = _html_mod.unescape(title_m.group(1)) if title_m else "A Poem"
+
+    desc_m = re.search(r'og:description" content="(.*?)"', content)
+    desc = _html_mod.unescape(desc_m.group(1)) if desc_m else ""
+
+    # Split description into lines
+    if " \u2022 " in desc:
+        lines = desc.split(" \u2022 ")
+    elif " / " in desc:
+        lines = desc.split(" / ")
+    else:
+        lines = [desc] if desc else []
+
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+
+        W, H = 1200, 630
+        # Light mode — matching the website's default palette
+        BG = (250, 248, 245)      # #faf8f5
+        ACCENT = (122, 78, 45)    # #7a4e2d
+        FG = (44, 44, 44)         # #2c2c2c
+        MUTED = (176, 160, 144)   # #b0a090
+
+        img = Image.new("RGBA", (W, H), BG + (255,))
+        draw = ImageDraw.Draw(img)
+
+        # Load text font (serif) and emoji font
+        def _load(paths: list[str], size: int):
+            for p in paths:
+                try:
+                    return ImageFont.truetype(p, size)
+                except (OSError, IOError):
+                    continue
+            return ImageFont.load_default()
+
+        SERIF_PATHS = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/System/Library/Fonts/Georgia.ttf",
+        ]
+        EMOJI_PATHS = [
+            "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+            "/System/Library/Fonts/Apple Color Emoji.ttc",
+        ]
+
+        font_brand = _load(SERIF_PATHS, 22)
+        font_title = _load(SERIF_PATHS, 44)
+        font_body = _load(SERIF_PATHS, 30)
+
+        # NotoColorEmoji is CBDT bitmap — only works at native size 109
+        font_emoji = None
+        for p in EMOJI_PATHS:
+            try:
+                font_emoji = ImageFont.truetype(p, 109)
+                break
+            except (OSError, IOError):
+                continue
+
+        def _is_emoji(c: str) -> bool:
+            cp = ord(c)
+            return (
+                0x1F600 <= cp <= 0x1F64F
+                or 0x1F300 <= cp <= 0x1F5FF
+                or 0x1F680 <= cp <= 0x1F6FF
+                or 0x1F900 <= cp <= 0x1F9FF
+                or 0x1FA00 <= cp <= 0x1FAFF
+                or 0x2600 <= cp <= 0x26FF
+                or 0x2700 <= cp <= 0x27BF
+                or 0x2300 <= cp <= 0x23FF
+                or 0x2B50 <= cp <= 0x2B55
+                or (0x203C <= cp <= 0x3299
+                    and cp not in range(0x2100, 0x2200))
+            )
+
+        def _render_emoji(ch: str, target_h: int) -> Image.Image | None:
+            """Render a single emoji at native size, scale to target_h."""
+            if not font_emoji:
+                return None
+            try:
+                bbox = font_emoji.getbbox(ch)
+                if not bbox or bbox[2] - bbox[0] == 0:
+                    return None
+                ew, eh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                tmp = Image.new("RGBA", (ew + 20, eh + 20), (0, 0, 0, 0))
+                d = ImageDraw.Draw(tmp)
+                d.text((-bbox[0], -bbox[1]), ch, font=font_emoji,
+                       embedded_color=True)
+                # Scale down to target height
+                ratio = target_h / eh
+                new_w = max(1, int(ew * ratio))
+                return tmp.resize((new_w, target_h), Image.LANCZOS)
+            except Exception:
+                return None
+
+        def _draw_line(
+            x: int, y: int, text: str, fill: tuple,
+            text_font, emoji_h: int,
+        ) -> None:
+            """Draw text with automatic emoji rendering + scaling."""
+            for ch in text:
+                if _is_emoji(ch):
+                    emoji_img = _render_emoji(ch, emoji_h)
+                    if emoji_img:
+                        img.paste(emoji_img, (x, y), emoji_img)
+                        x += emoji_img.width + 2
+                    else:
+                        x += 4  # skip unknown emoji
+                elif ord(ch) >= 0xFE00:
+                    continue  # skip variation selectors
+                else:
+                    draw.text((x, y), ch, fill=fill, font=text_font)
+                    bbox = text_font.getbbox(ch)
+                    x += (bbox[2] - bbox[0]) if bbox else 12
+
+        draw.text((100, 80), "ghostwriter", fill=MUTED + (255,), font=font_brand)
+        _draw_line(100, 150, title[:50], ACCENT + (255,), font_title, 44)
+
+        y = 260
+        for ln in lines[:6]:
+            _draw_line(100, y, ln[:65], FG + (255,), font_body, 30)
+            y += 48
+
+        # Flatten RGBA → RGB (emoji compositing needs alpha channel)
+        flat = Image.new("RGB", img.size, BG)
+        flat.paste(img, mask=img.split()[3])
+
+        buf = io.BytesIO()
+        flat.save(buf, format="PNG", optimize=True)
+        buf.seek(0)
+
+        from flask import Response
+
+        return Response(buf.getvalue(), mimetype="image/png", headers={
+            "Cache-Control": "public, max-age=86400",
+        })
+
+    except ImportError:
+        from flask import Response
+
+        return Response("Pillow not installed", status=500)
+
+
 # ---------------------------------------------------------------------------
 # API
 # ---------------------------------------------------------------------------
@@ -119,12 +289,66 @@ def view_poem(poem_id: str):
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "model_ready": _model_ready})
+    info: dict = {"status": "ok", "model_ready": _model_ready}
+    if _preload_error:
+        info["error"] = _preload_error
+    return jsonify(info)
 
 
 @app.route("/api/status")
 def api_status():
     return jsonify({"model_ready": _model_ready})
+
+
+@app.route("/api/debug")
+def api_debug():
+    """Temporary debug endpoint to inspect volume & env."""
+    import shutil
+
+    gensim_dir = os.environ.get("GENSIM_DATA_DIR", "~/gensim-data")
+    data_dir = Path("/data")
+    gensim_path = Path(gensim_dir)
+
+    def tree(p: Path, depth: int = 2) -> list:
+        items = []
+        if not p.exists():
+            return [f"(not found: {p})"]
+        try:
+            for child in sorted(p.iterdir()):
+                info = f"{child.name}/"
+                if child.is_file():
+                    info = f"{child.name} ({child.stat().st_size:,} bytes)"
+                items.append(info)
+                if child.is_dir() and depth > 0:
+                    for sub in tree(child, depth - 1):
+                        items.append(f"  {sub}")
+        except PermissionError:
+            items.append("(permission denied)")
+        return items
+
+    disk = shutil.disk_usage("/data") if data_dir.exists() else None
+    return jsonify(
+        {
+            "gensim_data_dir_env": gensim_dir,
+            "gensim_path_exists": gensim_path.exists(),
+            "gensim_contents": tree(gensim_path),
+            "data_contents": tree(data_dir),
+            "disk": {
+                "total_mb": disk.total // (1024 * 1024),
+                "used_mb": disk.used // (1024 * 1024),
+                "free_mb": disk.free // (1024 * 1024),
+            }
+            if disk
+            else None,
+            "model_ready": _model_ready,
+            "preload_error": _preload_error,
+            "preload_thread_alive": any(
+                t.name == "Thread-1" or "_preload" in str(t)
+                for t in threading.enumerate()
+            ),
+            "active_threads": [t.name for t in threading.enumerate()],
+        }
+    )
 
 
 @app.route("/api/morph", methods=["POST"])
@@ -172,7 +396,9 @@ def api_save():
         f"{time.time():.6f}{text[:100]}".encode()
     ).hexdigest()[:8]
 
-    base_url = f"{request.scheme}://{request.host}/p/{poem_id}"
+    # Always use https for OG URLs (Fly.io proxies as http internally)
+    scheme = "https" if request.headers.get("X-Forwarded-Proto") == "https" or request.host != "localhost" else "http"
+    base_url = f"{scheme}://{request.host}/p/{poem_id}"
 
     from ghostwriter.web import render_poem_html
 

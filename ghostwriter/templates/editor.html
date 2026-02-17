@@ -271,11 +271,59 @@ button:disabled { opacity: 0.4; cursor: default; }
   font-weight: 600;
   background: var(--tag-bg);
 }
+.alt-check {
+  display: inline-block;
+  width: 1.1em;
+  height: 1.1em;
+  border: 2px solid var(--muted);
+  border-radius: 4px;
+  margin-right: 0.6rem;
+  vertical-align: -0.15em;
+  position: relative;
+  transition: all 0.15s;
+  flex-shrink: 0;
+}
+.alt-opt.selected .alt-check {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+.alt-opt.selected .alt-check::after {
+  content: '';
+  position: absolute;
+  left: 3px; top: 0px;
+  width: 5px; height: 9px;
+  border: solid var(--bg);
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
 .alt-score {
   float: right;
   font-size: 0.75rem;
   color: var(--muted);
   font-weight: normal;
+}
+.alt-custom {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--ghost);
+}
+.alt-custom input {
+  flex: 1;
+  font-family: inherit;
+  font-size: 0.95rem;
+  padding: 0.5rem 0.75rem;
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid var(--ghost);
+  border-radius: 6px;
+}
+.alt-custom input:focus { outline: none; border-color: var(--accent); }
+.alt-custom input::placeholder { color: var(--muted); }
+.alt-custom button {
+  font-size: 0.85rem;
+  padding: 0.5rem 0.9rem;
 }
 
 /* ---- share result ---- */
@@ -315,6 +363,21 @@ button:disabled { opacity: 0.4; cursor: default; }
   body { padding: 1.5rem 1rem 2.5rem; }
   textarea { min-height: 35vh; font-size: 1rem; padding: 1rem; }
   .poem-words { font-size: 1rem; line-height: 2; }
+}
+
+/* ---- cycling morphed words ---- */
+.morphed-word {
+  transition: opacity 0.35s ease;
+}
+.morphed-word.fading {
+  opacity: 0;
+}
+.cycle-count {
+  font-size: 0.6em;
+  color: var(--muted);
+  vertical-align: super;
+  margin-left: 0.1em;
+  font-style: normal;
 }
 
 /* ---- loading spinner ---- */
@@ -377,9 +440,13 @@ button:disabled { opacity: 0.4; cursor: default; }
   <div class="alt-panel" onclick="event.stopPropagation()">
     <div class="alt-header">
       <span id="alt-original" class="alt-original"></span>
-      <button class="alt-close" onclick="closeAlts()">&times;</button>
+      <button class="alt-close" onclick="closeAlts()">done</button>
     </div>
     <div id="alt-options" class="alt-options"></div>
+    <div class="alt-custom">
+      <input id="alt-custom-input" type="text" placeholder="add a word...">
+      <button onclick="addCustomWord()">add</button>
+    </div>
   </div>
 </div>
 
@@ -398,9 +465,11 @@ function apiHeaders() {
 
 let poemLines = [];    // [{tokens: [{text, isWord, tagged, idx}]}]
 let nextIdx = 0;
-let morphData = {};    // idx -> {original, candidates, selectedIdx}
-let currentMorphed = {}; // {originalLower: replacementLower}
+// morphData[idx] = {original, originalLower, candidates, selectedWords[], customWords[]}
+let morphData = {};
 let altTarget = null;  // idx of word showing alternatives
+let cycleTimer = null;
+let cycleIdx = 0;
 
 // =====================================================================
 // Helpers
@@ -409,6 +478,8 @@ let altTarget = null;  // idx of word showing alternatives
 function showStep(name) {
   document.querySelectorAll('.step').forEach(el => el.classList.remove('active'));
   document.getElementById('step-' + name).classList.add('active');
+  if (name === 'result') startCycling();
+  else stopCycling();
 }
 
 function matchCase(original, replacement) {
@@ -418,6 +489,26 @@ function matchCase(original, replacement) {
   if (original[0] === original[0].toUpperCase())
     return replacement[0].toUpperCase() + replacement.slice(1);
   return replacement;
+}
+
+function needsAn(word) {
+  return word && 'aeiou'.includes(word[0].toLowerCase());
+}
+
+function adjustArticle(morphedEl, newWord) {
+  // Look at the previous text node; if it ends with " a " or " an ",
+  // swap to match the new word's leading sound.
+  const prev = morphedEl.previousSibling;
+  if (!prev || prev.nodeType !== 3) return;
+  const t = prev.textContent;
+  const vowel = needsAn(newWord);
+  const fixed = t.replace(/(^|\s)(a|an|A|An|AN)\s$/, function(_, pre, art) {
+    let target = vowel ? 'an' : 'a';
+    if (art === art.toUpperCase() && art.length > 1) target = target.toUpperCase();
+    else if (art[0] === art[0].toUpperCase()) target = target[0].toUpperCase() + target.slice(1);
+    return pre + target + ' ';
+  });
+  if (fixed !== t) prev.textContent = fixed;
 }
 
 function tokenizeLine(line) {
@@ -562,46 +653,61 @@ function doMorph() {
   btn.disabled = true;
   btn.textContent = 'morphing...';
 
-  fetch('/api/morph', {
-    method: 'POST',
-    headers: apiHeaders(),
-    body: JSON.stringify({vibe, words}),
-  })
-  .then(r => {
-    if (!r.ok) throw new Error('Server returned ' + r.status);
-    return r.json();
-  })
-  .then(data => {
-    if (data.error) { alert(data.error); return; }
-
-    morphData = {};
-    currentMorphed = {};
-
-    data.results.forEach((result, i) => {
-      const tok = tagged[i];
-      morphData[tok.idx] = {
-        original: tok.text,
-        originalLower: result.original,
-        candidates: result.candidates,
-        selectedIdx: result.candidates.length > 0 ? 0 : -1,
-      };
-      if (result.candidates.length > 0) {
-        currentMorphed[result.original] = result.candidates[0].word;
+  function attempt() {
+    fetch('/api/morph', {
+      method: 'POST',
+      headers: apiHeaders(),
+      body: JSON.stringify({vibe, words}),
+    })
+    .then(r => {
+      if (r.status === 503) {
+        // Model still loading — wait and retry
+        btn.textContent = 'waiting for model...';
+        setTimeout(attempt, 3000);
+        return null;
       }
-    });
+      if (!r.ok) throw new Error('Server returned ' + r.status);
+      return r.json();
+    })
+    .then(data => {
+      if (!data) return; // 503 retry in progress
+      if (data.error) { alert(data.error); return; }
 
-    renderResult();
-    showStep('result');
-  })
-  .catch(err => alert('Morph failed: ' + err.message))
-  .finally(() => {
-    btn.disabled = false;
-    btn.textContent = 'morph';
-  });
+      morphData = {};
+
+      data.results.forEach((result, i) => {
+        const tok = tagged[i];
+        // Start with the original word, then add top candidate
+        const selected = [result.original];
+        if (result.candidates.length > 0) {
+          const top = result.candidates[0].word;
+          if (top !== result.original) selected.push(top);
+        }
+        morphData[tok.idx] = {
+          original: tok.text,
+          originalLower: result.original,
+          candidates: result.candidates,
+          selectedWords: selected,
+          customWords: [],
+        };
+      });
+
+      renderResult();
+      showStep('result');
+      btn.disabled = false;
+      btn.textContent = 'morph';
+    })
+    .catch(err => {
+      alert('Morph failed: ' + err.message);
+      btn.disabled = false;
+      btn.textContent = 'morph';
+    });
+  }
+  attempt();
 }
 
 // =====================================================================
-// Step 3: Render results
+// Step 3: Render results + cycling
 // =====================================================================
 
 function renderResult() {
@@ -621,15 +727,22 @@ function renderResult() {
 
     line.tokens.forEach(tok => {
       const md = morphData[tok.idx];
-      if (md && md.selectedIdx >= 0) {
-        const cand = md.candidates[md.selectedIdx].word;
-        const display = matchCase(md.original, cand);
+      if (md && md.selectedWords.length > 0) {
+        const display = matchCase(md.original, md.selectedWords[0]);
         const span = document.createElement('span');
         span.className = 'morphed-word';
         span.textContent = display;
         span.title = 'was: ' + md.original;
         span.dataset.idx = tok.idx;
+        span.dataset.original = md.original;
+        span.dataset.words = JSON.stringify(md.selectedWords);
         span.addEventListener('click', () => showAlts(tok.idx));
+        if (md.selectedWords.length > 1) {
+          const badge = document.createElement('span');
+          badge.className = 'cycle-count';
+          badge.textContent = md.selectedWords.length;
+          span.appendChild(badge);
+        }
         div.appendChild(span);
       } else {
         div.appendChild(document.createTextNode(tok.text));
@@ -640,10 +753,48 @@ function renderResult() {
   });
 
   document.getElementById('share-result').style.display = 'none';
+
+  // restart cycling with new data
+  if (document.getElementById('step-result').classList.contains('active')) {
+    startCycling();
+  }
+}
+
+function startCycling() {
+  stopCycling();
+  // Track current index per element to avoid repeats
+  document.querySelectorAll('#result-poem .morphed-word').forEach(el => {
+    el._ci = 0;
+  });
+  cycleTimer = setInterval(() => {
+    document.querySelectorAll('#result-poem .morphed-word').forEach(el => {
+      const words = JSON.parse(el.dataset.words || '[]');
+      if (words.length <= 1) return;
+      const orig = el.dataset.original;
+      // Pick a random index different from current
+      const cur = el._ci || 0;
+      let next = Math.floor(Math.random() * (words.length - 1));
+      if (next >= cur) next++;
+      el._ci = next;
+      const w = matchCase(orig, words[next]);
+      el.classList.add('fading');
+      setTimeout(() => {
+        const badge = el.querySelector('.cycle-count');
+        el.textContent = w;
+        if (badge) el.appendChild(badge);
+        adjustArticle(el, words[next]);
+        el.classList.remove('fading');
+      }, 350);
+    });
+  }, 3000);
+}
+
+function stopCycling() {
+  if (cycleTimer) { clearInterval(cycleTimer); cycleTimer = null; }
 }
 
 // =====================================================================
-// Alternatives overlay
+// Alternatives overlay (multi-select + custom words)
 // =====================================================================
 
 function showAlts(idx) {
@@ -655,25 +806,71 @@ function showAlts(idx) {
   const container = document.getElementById('alt-options');
   container.innerHTML = '';
 
-  md.candidates.forEach((c, i) => {
+  // Combine candidates + custom words into a unified list
+  const allWords = md.candidates.map(c => ({word: c.word, score: c.score, custom: false}));
+  md.customWords.forEach(w => {
+    if (!allWords.find(a => a.word === w)) {
+      allWords.push({word: w, score: null, custom: true});
+    }
+  });
+
+  allWords.forEach(item => {
     const btn = document.createElement('button');
-    btn.className = 'alt-opt' + (i === md.selectedIdx ? ' selected' : '');
-    const display = matchCase(md.original, c.word);
-    btn.innerHTML = display + '<span class="alt-score">' + c.score.toFixed(3) + '</span>';
-    btn.addEventListener('click', () => selectAlt(idx, i));
+    const isSelected = md.selectedWords.includes(item.word);
+    btn.className = 'alt-opt' + (isSelected ? ' selected' : '');
+
+    const display = matchCase(md.original, item.word);
+    let inner = '<span class="alt-check"></span>' + display;
+    if (item.score !== null) {
+      inner += '<span class="alt-score">' + item.score.toFixed(3) + '</span>';
+    } else {
+      inner += '<span class="alt-score">custom</span>';
+    }
+    btn.innerHTML = inner;
+    btn.addEventListener('click', () => toggleWord(idx, item.word));
     container.appendChild(btn);
   });
 
+  document.getElementById('alt-custom-input').value = '';
   document.getElementById('alt-overlay').classList.add('open');
 }
 
-function selectAlt(idx, candidateIdx) {
+function toggleWord(idx, word) {
   const md = morphData[idx];
-  md.selectedIdx = candidateIdx;
-  currentMorphed[md.originalLower] = md.candidates[candidateIdx].word;
-  closeAlts();
+  const i = md.selectedWords.indexOf(word);
+  if (i >= 0) {
+    md.selectedWords.splice(i, 1);
+  } else {
+    md.selectedWords.push(word);
+  }
+  // re-render the overlay to update checkboxes
+  showAlts(idx);
   renderResult();
 }
+
+function addCustomWord() {
+  if (altTarget === null) return;
+  const input = document.getElementById('alt-custom-input');
+  const word = input.value.trim().toLowerCase();
+  if (!word || !/^[a-z]+$/i.test(word)) return;
+
+  const md = morphData[altTarget];
+  if (!md.customWords.includes(word)) {
+    md.customWords.push(word);
+  }
+  if (!md.selectedWords.includes(word)) {
+    md.selectedWords.push(word);
+  }
+
+  input.value = '';
+  showAlts(altTarget);
+  renderResult();
+}
+
+// Handle Enter key in custom word input
+document.getElementById('alt-custom-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); addCustomWord(); }
+});
 
 function closeAlts(e) {
   if (e && e.target !== document.getElementById('alt-overlay')) return;
@@ -690,24 +887,48 @@ function backToTag() {
 // Save & Share
 // =====================================================================
 
+function fixArticlesInText(text) {
+  // Fix "a <vowel-word>" → "an <vowel-word>" and vice versa
+  return text.replace(/\b(a|an|A|An|AN)\s+([A-Za-z])/g, function(m, art, ch) {
+    const vowel = 'aeiou'.includes(ch.toLowerCase());
+    let target = vowel ? 'an' : 'a';
+    if (art === art.toUpperCase() && art.length > 1) target = target.toUpperCase();
+    else if (art[0] === art[0].toUpperCase()) target = target[0].toUpperCase() + target.slice(1);
+    return target + ' ' + ch;
+  });
+}
+
 function buildFinalText() {
   let text = '';
   poemLines.forEach((line, li) => {
     if (li > 0) text += '\n';
     line.tokens.forEach(tok => {
       const md = morphData[tok.idx];
-      if (md && md.selectedIdx >= 0) {
-        text += matchCase(md.original, md.candidates[md.selectedIdx].word);
+      if (md && md.selectedWords.length > 0) {
+        text += matchCase(md.original, md.selectedWords[0]);
       } else {
         text += tok.text;
       }
     });
   });
-  return text;
+  return fixArticlesInText(text);
+}
+
+function buildWordCycles() {
+  // {originalLower: [word1, word2, ...]}
+  const cycles = {};
+  for (const idx in morphData) {
+    const md = morphData[idx];
+    if (md.selectedWords.length > 0) {
+      cycles[md.originalLower] = md.selectedWords;
+    }
+  }
+  return cycles;
 }
 
 function savePoem() {
   const text = buildFinalText();
+  const wordCycles = buildWordCycles();
   const btn = document.getElementById('btn-save');
   btn.disabled = true;
   btn.textContent = 'saving...';
@@ -715,7 +936,7 @@ function savePoem() {
   fetch('/api/save', {
     method: 'POST',
     headers: apiHeaders(),
-    body: JSON.stringify({text, morphed: currentMorphed}),
+    body: JSON.stringify({text, morphed: wordCycles}),
   })
   .then(r => r.json())
   .then(data => {
@@ -743,7 +964,6 @@ function copyUrl() {
       setTimeout(() => btn.textContent = orig, 2000);
     });
   } else {
-    // Fallback
     const ta = document.createElement('textarea');
     ta.value = url;
     document.body.appendChild(ta);
