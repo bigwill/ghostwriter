@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ghostwriter — poems</title>
+<title>ghostwriter</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1f47b;</text></svg>">
 
 <style>
@@ -15,6 +15,7 @@
   --muted: #b0a090;
   --ghost: rgba(0,0,0,0.08);
   --accent:#7a4e2d;
+  --danger:#a04040;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -23,6 +24,7 @@
     --muted: #6e6358;
     --ghost: rgba(255,255,255,0.08);
     --accent:#c9a57a;
+    --danger:#c06060;
   }
 }
 
@@ -59,31 +61,35 @@ h1 {
   letter-spacing: 0.02em;
 }
 
-.poem-list { list-style: none; }
+.writing-list { list-style: none; }
 
-.poem-card {
+.writing-item {
+  position: relative;
+  border-bottom: 1px solid var(--ghost);
+}
+.writing-item:first-child {
+  border-top: 1px solid var(--ghost);
+}
+
+.writing-card {
   display: block;
   text-decoration: none;
   color: var(--fg);
   padding: 1.25rem 1rem;
-  border-bottom: 1px solid var(--ghost);
   transition: background 0.15s;
 }
-.poem-card:first-child {
-  border-top: 1px solid var(--ghost);
-}
-.poem-card:hover {
+.writing-card:hover {
   background: var(--ghost);
 }
 
-.poem-title {
+.writing-title {
   display: block;
   font-size: 1.05rem;
   margin-bottom: 0.3rem;
   line-height: 1.5;
 }
 
-.poem-desc {
+.writing-desc {
   display: block;
   font-size: 0.85rem;
   color: var(--muted);
@@ -91,10 +97,30 @@ h1 {
   margin-bottom: 0.35rem;
 }
 
-.poem-date {
+.writing-date {
   font-size: 0.75rem;
   color: var(--muted);
   font-style: italic;
+}
+
+.btn-delete {
+  position: absolute;
+  top: 50%;
+  right: 0.75rem;
+  transform: translateY(-50%);
+  background: none;
+  border: 1px solid var(--ghost);
+  color: var(--muted);
+  font-size: 0.7rem;
+  padding: 0.3rem 0.55rem;
+  border-radius: 4px;
+  cursor: pointer;
+  font-family: inherit;
+  transition: color 0.15s, border-color 0.15s;
+}
+.btn-delete:hover {
+  color: var(--danger);
+  border-color: var(--danger);
 }
 
 .empty {
@@ -114,6 +140,7 @@ h1 {
   text-decoration: none;
 }
 .nav a:hover { text-decoration: underline; }
+.nav a + a { margin-left: 1.5em; }
 
 @media (max-width: 480px) {
   body { padding: 1.5rem 1rem 2.5rem; }
@@ -124,30 +151,59 @@ h1 {
 
 <div class="container">
   <p class="brand"><a href="/">ghostwriter</a></p>
-  <h1>poems</h1>
+  <h1>writings</h1>
 
-  {% if poems %}
-  <ul class="poem-list">
-    {% for poem in poems %}
-    <li>
-      <a class="poem-card" href="/p/{{ poem.id }}">
-        <span class="poem-title">{{ poem.title }}</span>
-        {% if poem.desc %}
-        <span class="poem-desc">{{ poem.desc }}</span>
+  {% if writings %}
+  <ul class="writing-list">
+    {% for w in writings %}
+    <li class="writing-item" data-id="{{ w.id }}">
+      <a class="writing-card" href="/p/{{ w.id }}">
+        <span class="writing-title">{{ w.title }}</span>
+        {% if w.desc %}
+        <span class="writing-desc">{{ w.desc }}</span>
         {% endif %}
-        <span class="poem-date">{{ poem.date }}</span>
+        <span class="writing-date">{{ w.date }}</span>
       </a>
+      {% if authenticated %}
+      <button class="btn-delete" onclick="deleteWriting(event, '{{ w.id }}')">delete</button>
+      {% endif %}
     </li>
     {% endfor %}
   </ul>
   {% else %}
-  <p class="empty">no poems yet -- write one!</p>
+  <p class="empty">nothing here yet</p>
   {% endif %}
 
   <div class="nav">
-    <a href="/">write a new poem</a>
+    {% if authenticated %}
+    <a href="/write">new writing</a>
+    <a href="/logout">log out</a>
+    {% else %}
+    <a href="/login">log in</a>
+    {% endif %}
   </div>
 </div>
+
+{% if authenticated %}
+<script>
+function deleteWriting(e, id) {
+  e.preventDefault();
+  e.stopPropagation();
+  if (!confirm('Delete this writing?')) return;
+  fetch('/api/delete/' + id, { method: 'DELETE' })
+    .then(function(r) {
+      if (!r.ok) throw new Error('Delete failed');
+      var item = document.querySelector('[data-id="' + id + '"]');
+      if (item) item.remove();
+      if (!document.querySelector('.writing-item')) {
+        document.querySelector('.writing-list').outerHTML =
+          '<p class="empty">nothing here yet</p>';
+      }
+    })
+    .catch(function(err) { alert(err.message); });
+}
+</script>
+{% endif %}
 
 </body>
 </html>

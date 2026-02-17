@@ -1,12 +1,13 @@
-"""Ghostwriter web -- a phone-friendly editor for morphing poems.
+"""Ghostwriter web -- a phone-friendly editor for morphing writings.
 
 Run with:
     ghostwriter-web     (after pip install -e .)
     python -m ghostwriter.server
 
 Environment variables:
-    GHOSTWRITER_POEMS_DIR   Where to store poem HTML files (default: ./poems)
+    GHOSTWRITER_POEMS_DIR   Where to store writing HTML files (default: ./poems)
     GHOSTWRITER_API_KEY     Protect POST endpoints; leave unset for open access
+    GHOSTWRITER_PASSWORD    Password for the editor / admin features
     GENSIM_DATA_DIR         Cache location for GloVe vectors (default: ~/gensim-data)
 """
 
@@ -21,7 +22,16 @@ import threading
 import time
 from pathlib import Path
 
-from flask import Flask, abort, jsonify, render_template, request
+from flask import (
+    Flask,
+    abort,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("ghostwriter")
@@ -32,14 +42,19 @@ log = logging.getLogger("ghostwriter")
 
 POEMS_DIR = Path(os.environ.get("GHOSTWRITER_POEMS_DIR", "poems"))
 API_KEY = os.environ.get("GHOSTWRITER_API_KEY", "")
+PASSWORD = os.environ.get("GHOSTWRITER_PASSWORD", "")
 
 app = Flask(__name__)
+app.secret_key = os.environ.get(
+    "FLASK_SECRET_KEY",
+    hashlib.sha256((API_KEY or "ghostwriter-dev").encode()).hexdigest(),
+)
 
 # Ensure poems directory exists at startup
 POEMS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
-# Auth helper
+# Auth helpers
 # ---------------------------------------------------------------------------
 
 
@@ -50,6 +65,13 @@ def _require_api_key() -> None:
     provided = request.headers.get("X-Api-Key") or request.args.get("key")
     if provided != API_KEY:
         abort(403)
+
+
+def _is_authenticated() -> bool:
+    """Return True if the user has logged in via session."""
+    if not PASSWORD:
+        return True  # no password set → always authenticated (local dev)
+    return session.get("authenticated") is True
 
 
 # ---------------------------------------------------------------------------
@@ -86,13 +108,7 @@ threading.Thread(target=_preload, daemon=True).start()
 
 @app.route("/")
 def index():
-    # Inject the API key so browser JS can authenticate to POST endpoints
-    return render_template("editor.html", api_key=API_KEY)
-
-
-@app.route("/poems")
-def gallery():
-    poems: list[dict] = []
+    writings: list[dict] = []
     if POEMS_DIR.exists():
         for f in sorted(
             POEMS_DIR.glob("*.html"),
@@ -102,7 +118,7 @@ def gallery():
             content = f.read_text(encoding="utf-8")
             title_m = re.search(r"<title>(.*?)</title>", content)
             desc_m = re.search(r'og:description" content="(.*?)"', content)
-            poems.append(
+            writings.append(
                 {
                     "id": f.stem,
                     "title": title_m.group(1) if title_m else f.stem,
@@ -113,7 +129,42 @@ def gallery():
                     ),
                 }
             )
-    return render_template("gallery.html", poems=poems)
+    return render_template(
+        "gallery.html",
+        writings=writings,
+        authenticated=_is_authenticated(),
+    )
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if _is_authenticated():
+        return redirect(url_for("write"))
+    error = None
+    if request.method == "POST":
+        if request.form.get("password") == PASSWORD:
+            session["authenticated"] = True
+            return redirect(request.args.get("next") or url_for("write"))
+        error = "wrong password"
+    return render_template("login.html", error=error)
+
+
+@app.route("/logout")
+def logout():
+    session.pop("authenticated", None)
+    return redirect(url_for("index"))
+
+
+@app.route("/poems")
+def poems_redirect():
+    return redirect(url_for("index"), code=301)
+
+
+@app.route("/write")
+def write():
+    if not _is_authenticated():
+        return redirect(url_for("login", next="/write"))
+    return render_template("editor.html", api_key=API_KEY)
 
 
 @app.route("/p/<poem_id>")
@@ -126,26 +177,24 @@ def view_poem(poem_id: str):
     return path.read_text(encoding="utf-8")
 
 
-@app.route("/og/<poem_id>.png")
-def og_image(poem_id: str):
-    """Generate a 1200x630 OG image (PNG) for iMessage / social previews."""
+def _parse_og_content(poem_id: str):
+    """Parse a saved writing's HTML and return (title, lines, cycling_data) or None."""
     import html as _html_mod
-    import io
+    import json as _json_mod
 
     if not re.fullmatch(r"[a-f0-9]{8}", poem_id):
-        return "Not found", 404
+        return None
     path = POEMS_DIR / f"{poem_id}.html"
     if not path.exists():
-        return "Not found", 404
+        return None
 
     content = path.read_text(encoding="utf-8")
     title_m = re.search(r"<title>(.*?)</title>", content)
-    title = _html_mod.unescape(title_m.group(1)) if title_m else "A Poem"
+    title = _html_mod.unescape(title_m.group(1)) if title_m else "Untitled"
 
     desc_m = re.search(r'og:description" content="(.*?)"', content)
     desc = _html_mod.unescape(desc_m.group(1)) if desc_m else ""
 
-    # Split description into lines
     if " \u2022 " in desc:
         lines = desc.split(" \u2022 ")
     elif " / " in desc:
@@ -153,133 +202,268 @@ def og_image(poem_id: str):
     else:
         lines = [desc] if desc else []
 
-    try:
-        from PIL import Image, ImageDraw, ImageFont
-
-        W, H = 1200, 630
-        # Light mode — matching the website's default palette
-        BG = (250, 248, 245)      # #faf8f5
-        ACCENT = (122, 78, 45)    # #7a4e2d
-        FG = (44, 44, 44)         # #2c2c2c
-        MUTED = (176, 160, 144)   # #b0a090
-
-        img = Image.new("RGBA", (W, H), BG + (255,))
-        draw = ImageDraw.Draw(img)
-
-        # Load text font (serif) and emoji font
-        def _load(paths: list[str], size: int):
-            for p in paths:
-                try:
-                    return ImageFont.truetype(p, size)
-                except (OSError, IOError):
-                    continue
-            return ImageFont.load_default()
-
-        SERIF_PATHS = [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/System/Library/Fonts/Georgia.ttf",
-        ]
-        EMOJI_PATHS = [
-            "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
-            "/System/Library/Fonts/Apple Color Emoji.ttc",
-        ]
-
-        font_brand = _load(SERIF_PATHS, 22)
-        font_title = _load(SERIF_PATHS, 44)
-        font_body = _load(SERIF_PATHS, 30)
-
-        # NotoColorEmoji is CBDT bitmap — only works at native size 109
-        font_emoji = None
-        for p in EMOJI_PATHS:
-            try:
-                font_emoji = ImageFont.truetype(p, 109)
-                break
-            except (OSError, IOError):
-                continue
-
-        def _is_emoji(c: str) -> bool:
-            cp = ord(c)
-            return (
-                0x1F600 <= cp <= 0x1F64F
-                or 0x1F300 <= cp <= 0x1F5FF
-                or 0x1F680 <= cp <= 0x1F6FF
-                or 0x1F900 <= cp <= 0x1F9FF
-                or 0x1FA00 <= cp <= 0x1FAFF
-                or 0x2600 <= cp <= 0x26FF
-                or 0x2700 <= cp <= 0x27BF
-                or 0x2300 <= cp <= 0x23FF
-                or 0x2B50 <= cp <= 0x2B55
-                or (0x203C <= cp <= 0x3299
-                    and cp not in range(0x2100, 0x2200))
+    # Find cycling words: [(displayed_word, [alternatives], case_type)]
+    cycling = []
+    for m in re.finditer(
+        r"data-original=\"([^\"]*)\"\s*"
+        r"data-case=\"([^\"]*)\"\s*"
+        r"data-words='(\[[^']*\])'"
+        r"[^>]*>([^<]+)<",
+        content,
+    ):
+        words = _json_mod.loads(_html_mod.unescape(m.group(3)))
+        if len(words) > 1:
+            cycling.append(
+                {
+                    "current": _html_mod.unescape(m.group(4)),
+                    "words": words,
+                    "case": m.group(2),
+                }
             )
 
-        def _render_emoji(ch: str, target_h: int) -> Image.Image | None:
-            """Render a single emoji at native size, scale to target_h."""
-            if not font_emoji:
-                return None
+    return title, lines, cycling
+
+
+def _load_og_fonts():
+    """Load and return (font_brand, font_title, font_body, font_emoji)."""
+    from PIL import ImageFont
+
+    def _load(paths: list[str], size: int):
+        for p in paths:
             try:
-                bbox = font_emoji.getbbox(ch)
-                if not bbox or bbox[2] - bbox[0] == 0:
-                    return None
-                ew, eh = bbox[2] - bbox[0], bbox[3] - bbox[1]
-                tmp = Image.new("RGBA", (ew + 20, eh + 20), (0, 0, 0, 0))
-                d = ImageDraw.Draw(tmp)
-                d.text((-bbox[0], -bbox[1]), ch, font=font_emoji,
-                       embedded_color=True)
-                # Scale down to target height
-                ratio = target_h / eh
-                new_w = max(1, int(ew * ratio))
-                return tmp.resize((new_w, target_h), Image.LANCZOS)
-            except Exception:
+                return ImageFont.truetype(p, size)
+            except (OSError, IOError):
+                continue
+        return ImageFont.load_default()
+
+    serif = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/System/Library/Fonts/Georgia.ttf",
+    ]
+    emoji_paths = [
+        "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+        "/System/Library/Fonts/Apple Color Emoji.ttc",
+    ]
+
+    font_emoji = None
+    for p in emoji_paths:
+        try:
+            font_emoji = ImageFont.truetype(p, 109)
+            break
+        except (OSError, IOError):
+            continue
+
+    return _load(serif, 22), _load(serif, 44), _load(serif, 30), font_emoji
+
+
+def _is_emoji(c: str) -> bool:
+    cp = ord(c)
+    return (
+        0x1F600 <= cp <= 0x1F64F
+        or 0x1F300 <= cp <= 0x1F5FF
+        or 0x1F680 <= cp <= 0x1F6FF
+        or 0x1F900 <= cp <= 0x1F9FF
+        or 0x1FA00 <= cp <= 0x1FAFF
+        or 0x2600 <= cp <= 0x26FF
+        or 0x2700 <= cp <= 0x27BF
+        or 0x2300 <= cp <= 0x23FF
+        or 0x2B50 <= cp <= 0x2B55
+        or (0x203C <= cp <= 0x3299 and cp not in range(0x2100, 0x2200))
+    )
+
+
+_OG_W, _OG_H = 1200, 630
+_OG_BG = (250, 248, 245)
+_OG_ACCENT = (122, 78, 45)
+_OG_FG = (44, 44, 44)
+_OG_MUTED = (176, 160, 144)
+
+
+def _render_og_frame(title, lines, font_brand, font_title, font_body, font_emoji):
+    """Return an RGB PIL Image for one OG frame."""
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGBA", (_OG_W, _OG_H), _OG_BG + (255,))
+    draw = ImageDraw.Draw(img)
+
+    def _render_emoji(ch, target_h):
+        if not font_emoji:
+            return None
+        try:
+            bbox = font_emoji.getbbox(ch)
+            if not bbox or bbox[2] - bbox[0] == 0:
                 return None
+            ew, eh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            tmp = Image.new("RGBA", (ew + 20, eh + 20), (0, 0, 0, 0))
+            ImageDraw.Draw(tmp).text(
+                (-bbox[0], -bbox[1]), ch, font=font_emoji, embedded_color=True
+            )
+            ratio = target_h / eh
+            return tmp.resize((max(1, int(ew * ratio)), target_h), Image.LANCZOS)
+        except Exception:
+            return None
 
-        def _draw_line(
-            x: int, y: int, text: str, fill: tuple,
-            text_font, emoji_h: int,
-        ) -> None:
-            """Draw text with automatic emoji rendering + scaling."""
-            for ch in text:
-                if _is_emoji(ch):
-                    emoji_img = _render_emoji(ch, emoji_h)
-                    if emoji_img:
-                        img.paste(emoji_img, (x, y), emoji_img)
-                        x += emoji_img.width + 2
-                    else:
-                        x += 4  # skip unknown emoji
-                elif ord(ch) >= 0xFE00:
-                    continue  # skip variation selectors
+    def _draw_line(x, y, text, fill, text_font, emoji_h):
+        for ch in text:
+            if _is_emoji(ch):
+                ei = _render_emoji(ch, emoji_h)
+                if ei:
+                    img.paste(ei, (x, y), ei)
+                    x += ei.width + 2
                 else:
-                    draw.text((x, y), ch, fill=fill, font=text_font)
-                    bbox = text_font.getbbox(ch)
-                    x += (bbox[2] - bbox[0]) if bbox else 12
+                    x += 4
+            elif ord(ch) >= 0xFE00:
+                continue
+            else:
+                draw.text((x, y), ch, fill=fill, font=text_font)
+                bbox = text_font.getbbox(ch)
+                x += (bbox[2] - bbox[0]) if bbox else 12
 
-        draw.text((100, 80), "ghostwriter", fill=MUTED + (255,), font=font_brand)
-        _draw_line(100, 150, title[:50], ACCENT + (255,), font_title, 44)
+    # Left-justified with generous margin to survive iMessage cropping
+    LM = 250
 
-        y = 260
-        for ln in lines[:6]:
-            _draw_line(100, y, ln[:65], FG + (255,), font_body, 30)
-            y += 48
+    draw.text((LM, 100), "ghostwriter", fill=_OG_MUTED + (255,), font=font_brand)
+    _draw_line(LM, 170, title[:50], _OG_ACCENT + (255,), font_title, 44)
 
-        # Flatten RGBA → RGB (emoji compositing needs alpha channel)
-        flat = Image.new("RGB", img.size, BG)
-        flat.paste(img, mask=img.split()[3])
+    y = 270
+    for ln in lines[:5]:
+        _draw_line(LM, y, ln[:60], _OG_FG + (255,), font_body, 30)
+        y += 46
 
+    flat = Image.new("RGB", img.size, _OG_BG)
+    flat.paste(img, mask=img.split()[3])
+    return flat
+
+
+def _apply_case(word: str, case_type: str) -> str:
+    if case_type == "upper":
+        return word.upper()
+    if case_type == "title":
+        return word[0].upper() + word[1:]
+    return word
+
+
+@app.route("/og/<poem_id>.png")
+def og_image(poem_id: str):
+    """Static OG image (backwards compatibility)."""
+    import io
+
+    parsed = _parse_og_content(poem_id)
+    if not parsed:
+        return "Not found", 404
+    title, lines, _ = parsed
+
+    try:
+        fb, ft, fbo, fe = _load_og_fonts()
+        img = _render_og_frame(title, lines, fb, ft, fbo, fe)
         buf = io.BytesIO()
-        flat.save(buf, format="PNG", optimize=True)
+        img.save(buf, format="PNG", optimize=True)
         buf.seek(0)
-
         from flask import Response
 
-        return Response(buf.getvalue(), mimetype="image/png", headers={
-            "Cache-Control": "public, max-age=86400",
-        })
-
+        return Response(
+            buf.getvalue(),
+            mimetype="image/png",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
     except ImportError:
         from flask import Response
 
         return Response("Pillow not installed", status=500)
+
+
+@app.route("/og/<poem_id>.gif")
+def og_image_gif(poem_id: str):
+    """Animated OG image — cycles through alternative words."""
+    import io
+
+    from flask import Response
+
+    # Serve from cache if available
+    cache_dir = POEMS_DIR / "og_cache"
+    cache_path = cache_dir / f"{poem_id}.gif"
+    if cache_path.exists():
+        return Response(
+            cache_path.read_bytes(),
+            mimetype="image/gif",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
+    parsed = _parse_og_content(poem_id)
+    if not parsed:
+        return "Not found", 404
+    title, lines, cycling = parsed
+
+    if not cycling:
+        return redirect(f"/og/{poem_id}.png")
+
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+
+        W, H = 1200, 630
+        fb, ft, fbo, _ = _load_og_fonts()
+
+        max_words = max(len(c["words"]) for c in cycling)
+        num_frames = min(max_words, 4)
+
+        LM = 250
+
+        def _render_simple(frame_title, frame_lines):
+            """Fast text-only frame (no emoji) for GIF."""
+            img = Image.new("RGB", (W, H), _OG_BG)
+            draw = ImageDraw.Draw(img)
+            draw.text((LM, 100), "ghostwriter", fill=_OG_MUTED, font=fb)
+            draw.text((LM, 170), frame_title[:50], fill=_OG_ACCENT, font=ft)
+            y = 270
+            for ln in frame_lines[:5]:
+                draw.text((LM, y), ln[:60], fill=_OG_FG, font=fbo)
+                y += 46
+            return img
+
+        frames = []
+        for fi in range(num_frames):
+            frame_title = title
+            frame_lines = list(lines)
+            for c in cycling:
+                word = c["words"][fi % len(c["words"])]
+                cased = _apply_case(word, c["case"])
+                frame_title = frame_title.replace(c["current"], cased)
+                frame_lines = [ln.replace(c["current"], cased) for ln in frame_lines]
+            frames.append(_render_simple(frame_title, frame_lines))
+
+        # Use first frame's palette for all frames (fast, consistent)
+        palette_img = frames[0].quantize(colors=128, method=2)
+        palette = palette_img.getpalette()
+        gif_frames = []
+        for f in frames:
+            q = f.quantize(colors=128, method=2)
+            q.putpalette(palette)
+            gif_frames.append(q)
+
+        buf = io.BytesIO()
+        gif_frames[0].save(
+            buf,
+            format="GIF",
+            save_all=True,
+            append_images=gif_frames[1:],
+            duration=2500,
+            loop=0,
+        )
+        buf.seek(0)
+        data = buf.getvalue()
+
+        # Cache to disk
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_path.write_bytes(data)
+
+        return Response(
+            data,
+            mimetype="image/gif",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+    except ImportError:
+        return redirect(f"/og/{poem_id}.png")
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +565,19 @@ def api_morph():
         )
 
     return jsonify({"results": results})
+
+
+@app.route("/api/delete/<writing_id>", methods=["DELETE"])
+def api_delete(writing_id: str):
+    if not _is_authenticated():
+        abort(403)
+    if not re.fullmatch(r"[a-f0-9]{8}", writing_id):
+        return jsonify({"error": "Invalid id"}), 400
+    path = POEMS_DIR / f"{writing_id}.html"
+    if not path.exists():
+        return jsonify({"error": "Not found"}), 404
+    path.unlink()
+    return jsonify({"ok": True})
 
 
 @app.route("/api/save", methods=["POST"])

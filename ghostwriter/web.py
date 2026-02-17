@@ -324,9 +324,10 @@ def render_poem_html(
         _id_match = re.search(r"/p/([a-f0-9]+)", base_url)
         if _id_match:
             img_base = base_url.replace("http://", "https://", 1)
-            img_url = img_base.rsplit("/p/", 1)[0] + "/og/" + _id_match.group(1) + ".png"
+            img_url = img_base.rsplit("/p/", 1)[0] + "/og/" + _id_match.group(1) + ".gif"
             og_image_tag = (
                 f'<meta property="og:image" content="{_esc.escape(img_url)}">\n'
+                f'<meta property="og:image:type" content="image/gif">\n'
                 f'<meta property="og:image:width" content="1200">\n'
                 f'<meta property="og:image:height" content="630">'
             )

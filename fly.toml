@@ -18,6 +18,7 @@ primary_region = "sjc"
 [env]
   GHOSTWRITER_POEMS_DIR = "/data/poems"
   GENSIM_DATA_DIR = "/data/gensim-data"
+  TZ = "America/Los_Angeles"
 
 [http_service]
   internal_port = 5000
