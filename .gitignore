@@ -6,6 +6,7 @@ dist/
 build/
 .eggs/
 *.pdf
+poem.html
 .venv/
 .env
 *.dat

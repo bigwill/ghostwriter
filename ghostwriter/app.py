@@ -150,6 +150,7 @@ class GhostwriterApp(App):
         Binding("escape", "stop_cycling", "Stop", show=False),
         Binding("f3", "render_pdf", "Render PDF"),
         Binding("f4", "push_device", "Push to DPT-RP1"),
+        Binding("f9", "share_poem", "Share"),
         Binding("ctrl+s", "save_poem", "Save poem"),
         Binding("ctrl+o", "load_poem", "Load poem"),
         Binding("ctrl+q", "quit", "Quit"),
@@ -696,6 +697,42 @@ class GhostwriterApp(App):
         elif event.state == WorkerState.ERROR:
             self.query_one("#status-bar", Static).update(
                 f"Push failed: {event.worker.error}"
+            )
+
+    # ---- share (web view) ------------------------------------------------
+
+    def action_share_poem(self) -> None:
+        """Generate a web view of the poem and serve it locally."""
+        editor = self.query_one("#editor", TextArea)
+        text = editor.text.strip()
+        if not text:
+            self.query_one("#status-bar", Static).update("Nothing to share")
+            return
+        self._do_share(text)
+
+    @work(thread=True, group="share")
+    def _do_share(self, text: str) -> str:
+        import webbrowser
+        from ghostwriter.web import render_poem_html, save_html, start_server
+
+        page = render_poem_html(text, morphed=dict(self.morphed))
+        save_html(page, "poem.html")
+        url = start_server(page)
+        webbrowser.open(url)
+        return url
+
+    @on(Worker.StateChanged)
+    def _share_done(self, event: Worker.StateChanged) -> None:
+        if event.worker.group != "share":
+            return
+        if event.state == WorkerState.SUCCESS:
+            url = event.worker.result
+            self.query_one("#status-bar", Static).update(
+                f"Sharing → {url}  (saved poem.html)"
+            )
+        elif event.state == WorkerState.ERROR:
+            self.query_one("#status-bar", Static).update(
+                f"Share failed: {event.worker.error}"
             )
 
     # ---- save / load poem ------------------------------------------------

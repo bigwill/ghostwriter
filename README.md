@@ -23,7 +23,8 @@ On first launch the app downloads GloVe word vectors (~128 MB, cached locally).
 3. **Tag words** — place cursor on a word and press **F2** to tag it for morphing. Repeat for as many words as you like.
 4. **Cycle** — press **F5**. Tagged words begin cycling through replacement candidates live in the editor.
 5. **Lock** — press **F7** on a cycling word to freeze it at the current replacement, or **F6** to freeze all words at once.
-6. **Render** a ghosted PDF (**F3**) and **push** it to your DPT-RP1 (**F4**).
+6. **Share** — press **F9** to open a beautiful web view of the poem. Morphed words show their originals as ghosts on hover. The page is also saved to `poem.html` with Open Graph tags for rich iOS Messages / social previews.
+7. **Render** a ghosted PDF (**F3**) and **push** it to your DPT-RP1 (**F4**).
 
 Replacements are drop-in: they match the original word's part of speech and
 tense/inflection, ranked by proximity to the vibe direction.
@@ -38,6 +39,7 @@ tense/inflection, ranked by proximity to the vibe direction.
 | F6 | Freeze all cycling words |
 | F7 | Lock individual word under cursor |
 | F8 | Toggle yellow highlight on cycling words |
+| F9 | Share — open web view + save poem.html |
 | F3 | Render ghosted PDF |
 | F4 | Push PDF to DPT-RP1 |
 | Ctrl+S | Save poem |
