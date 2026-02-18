@@ -400,3 +400,127 @@ def morph_words(
         )
         for w, ctx in zip(words, contexts)
     ]
+
+
+# ---------------------------------------------------------------------------
+# Emoji morphing
+# ---------------------------------------------------------------------------
+
+_EMOJI_STOP = frozenset({
+    "face", "with", "and", "of", "in", "on", "the", "a", "an",
+    "sign", "mark", "symbol", "button", "type", "skin", "tone",
+    "light", "medium", "dark",
+})
+
+_EMOJI_INDEX: dict[str, np.ndarray] | None = None
+_EMOJI_CHARS: list[str] | None = None
+
+
+_EMOJI_RANGES = [
+    (0x1F300, 0x1F5FF),  # Miscellaneous Symbols and Pictographs
+    (0x1F600, 0x1F64F),  # Emoticons
+    (0x1F680, 0x1F6FF),  # Transport and Map Symbols
+    (0x1F900, 0x1F9FF),  # Supplemental Symbols and Pictographs
+    (0x1FA70, 0x1FAFF),  # Symbols and Pictographs Extended-A
+    (0x2600, 0x27BF),    # Misc Symbols / Dingbats
+    (0x2300, 0x23FF),    # Misc Technical (⌚ etc.)
+]
+
+
+def _build_emoji_index(model: KeyedVectors) -> tuple[dict[str, np.ndarray], list[str]]:
+    """Build a mapping from emoji char to its meaning vector."""
+    import unicodedata
+
+    index: dict[str, np.ndarray] = {}
+    chars: list[str] = []
+
+    for start, end in _EMOJI_RANGES:
+        for cp in range(start, end + 1):
+            ch = chr(cp)
+            try:
+                name = unicodedata.name(ch)
+            except ValueError:
+                continue
+            cat = unicodedata.category(ch)
+            if cat not in ("So", "Sk"):
+                continue
+
+            keywords = [w.lower() for w in name.split() if w.lower() not in _EMOJI_STOP]
+            vecs = [model[k].astype(np.float64) for k in keywords if _in_vocab(model, k)]
+            if not vecs:
+                continue
+
+            mean = np.mean(vecs, axis=0)
+            norm = np.linalg.norm(mean)
+            if norm > 0:
+                mean /= norm
+            index[ch] = mean
+            chars.append(ch)
+
+    return index, chars
+
+
+def _get_emoji_index(model: KeyedVectors) -> tuple[dict[str, np.ndarray], list[str]]:
+    global _EMOJI_INDEX, _EMOJI_CHARS
+    if _EMOJI_INDEX is None:
+        _EMOJI_INDEX, _EMOJI_CHARS = _build_emoji_index(model)
+    return _EMOJI_INDEX, _EMOJI_CHARS
+
+
+def is_emoji(text: str) -> bool:
+    """Return True if text is a single emoji character."""
+    if len(text) != 1:
+        return False
+    cp = ord(text)
+    return (
+        0x1F300 <= cp <= 0x1FAFF
+        or 0x2600 <= cp <= 0x27BF
+        or 0x2300 <= cp <= 0x23FF
+    )
+
+
+def morph_emoji(
+    emoji: str,
+    target_vibe: str,
+    top_n: int = 8,
+    model: KeyedVectors | None = None,
+) -> MorphResult:
+    """Find emojis similar to *emoji* shifted toward *target_vibe*."""
+    if model is None:
+        model = load_model()
+
+    result = MorphResult(original=emoji, vibe=target_vibe, source_vibe=None)
+
+    index, chars = _get_emoji_index(model)
+    if emoji not in index:
+        return result
+
+    vibe_low = target_vibe.lower()
+    if not _in_vocab(model, vibe_low):
+        return result
+
+    source_vec = index[emoji]
+    vibe_vec = model[vibe_low].astype(np.float64)
+    vibe_norm = np.linalg.norm(vibe_vec)
+    if vibe_norm > 0:
+        vibe_vec /= vibe_norm
+
+    target_vec = source_vec + vibe_vec
+    norm = np.linalg.norm(target_vec)
+    if norm > 0:
+        target_vec /= norm
+
+    # Score all emojis by cosine similarity to the target
+    scored: list[tuple[str, float]] = []
+    for ch in chars:
+        if ch == emoji:
+            continue
+        score = float(np.dot(index[ch], target_vec))
+        scored.append((ch, score))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+
+    for ch, score in scored[:top_n]:
+        result.candidates.append(Candidate(word=ch, score=round(score, 4)))
+
+    return result

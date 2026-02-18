@@ -23,6 +23,7 @@ dependencies = [
 [project.scripts]
 ghostwriter = "ghostwriter.app:main"
 ghostwriter-web = "ghostwriter.server:main"
+ghostwriter-morph = "ghostwriter.morph_service:main"
 
 [tool.setuptools.packages.find]
 include = ["ghostwriter*"]

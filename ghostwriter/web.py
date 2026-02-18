@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Optional
 
-_WORD_RE = re.compile(r"[A-Za-z]+")
+_WORD_RE = re.compile(r"[A-Za-z]+|[\U0001F300-\U0001FAFF\u2600-\u27BF\u2300-\u23FF]")
 
 # ---------------------------------------------------------------------------
 # HTML template
@@ -123,6 +123,16 @@ body {{
   opacity: 1;
 }}
 
+.poem-title {{
+  max-width: 34em;
+  width: 100%;
+  font-size: 1.4rem;
+  font-weight: normal;
+  font-style: italic;
+  color: var(--accent);
+  margin-bottom: 1.5rem;
+  line-height: 1.4;
+}}
 .brand {{
   font-variant: small-caps;
   letter-spacing: 0.18em;
@@ -147,6 +157,7 @@ body {{
 </head>
 <body>
 
+{title_html}
 <article class="poem">
 {poem_html}
 </article>
@@ -256,7 +267,9 @@ def _poem_to_html(text: str, morphed: dict[str, str | list[str]]) -> str:
                 words_json = _esc.escape(_json.dumps(all_words))
                 cls = "morphed cycling" if len(all_words) > 1 else "morphed"
                 # Detect case pattern from the word as it appears in the poem
-                if word == word.upper() and len(word) > 1:
+                if not word[0].isalpha():
+                    case = "lower"  # emoji or symbol — no case
+                elif word == word.upper() and len(word) > 1:
                     case = "upper"
                 elif word[0].isupper():
                     case = "title"
@@ -303,8 +316,9 @@ def render_poem_html(
         morphed = {}
 
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    has_explicit_title = bool(title)
     if not title:
-        title = lines[0][:80] if lines else "A Poem"
+        title = lines[0][:80] if lines else "Untitled"
     # Use newline-separated lines for a readable preview
     og_desc = " \u2022 ".join(lines[:4])[:200] if lines else ""
 
@@ -337,14 +351,24 @@ def render_poem_html(
 
     poem_html = _poem_to_html(text, morphed)
 
+    title_html = ""
+    if has_explicit_title:
+        title_html = f'<h1 class="poem-title">{_esc.escape(title)}</h1>'
+
+    # Hidden marker so OG image generator knows if title was explicit
+    explicit_marker = (
+        f'<meta name="ghostwriter:has-title" content="{"yes" if has_explicit_title else "no"}">'
+    )
+
     return _TEMPLATE.format(
         title=_esc.escape(title),
         og_title=_esc.escape(title),
         og_description=_esc.escape(og_desc),
         og_url_tag=og_url_tag,
-        og_image_tag=og_image_tag,
+        og_image_tag=og_image_tag + "\n" + explicit_marker,
         twitter_image_tag=twitter_image_tag,
         poem_html=poem_html,
+        title_html=title_html,
     )
 
 

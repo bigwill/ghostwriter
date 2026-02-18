@@ -43,6 +43,7 @@ log = logging.getLogger("ghostwriter")
 POEMS_DIR = Path(os.environ.get("GHOSTWRITER_POEMS_DIR", "poems"))
 API_KEY = os.environ.get("GHOSTWRITER_API_KEY", "")
 PASSWORD = os.environ.get("GHOSTWRITER_PASSWORD", "")
+MORPH_SERVICE_URL = os.environ.get("MORPH_SERVICE_URL", "")
 
 app = Flask(__name__)
 app.secret_key = os.environ.get(
@@ -75,31 +76,32 @@ def _is_authenticated() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Background model loader
+# Background model loader (skipped when MORPH_SERVICE_URL is set)
 # ---------------------------------------------------------------------------
 
 _model_ready = False
-
-
 _preload_error: str | None = None
 
+if MORPH_SERVICE_URL:
+    log.info("Using external morph service at %s", MORPH_SERVICE_URL)
+    _model_ready = True  # we don't load locally; the service handles readiness
+else:
 
-def _preload() -> None:
-    global _model_ready, _preload_error
-    try:
-        log.info("PRELOAD: starting gensim import...")
-        from ghostwriter.morph import load_model
+    def _preload() -> None:
+        global _model_ready, _preload_error
+        try:
+            log.info("PRELOAD: starting gensim import...")
+            from ghostwriter.morph import load_model
 
-        log.info("PRELOAD: gensim imported, loading model...")
-        load_model()
-        _model_ready = True
-        log.info("PRELOAD: model ready!")
-    except Exception as e:
-        _preload_error = str(e)
-        log.exception("PRELOAD ERROR: %s", e)
+            log.info("PRELOAD: gensim imported, loading model...")
+            load_model()
+            _model_ready = True
+            log.info("PRELOAD: model ready!")
+        except Exception as e:
+            _preload_error = str(e)
+            log.exception("PRELOAD ERROR: %s", e)
 
-
-threading.Thread(target=_preload, daemon=True).start()
+    threading.Thread(target=_preload, daemon=True).start()
 
 # ---------------------------------------------------------------------------
 # Pages
@@ -178,7 +180,7 @@ def view_poem(poem_id: str):
 
 
 def _parse_og_content(poem_id: str):
-    """Parse a saved writing's HTML and return (title, lines, cycling_data) or None."""
+    """Parse a saved writing's HTML and return (title, has_title, lines, cycling) or None."""
     import html as _html_mod
     import json as _json_mod
 
@@ -192,6 +194,10 @@ def _parse_og_content(poem_id: str):
     title_m = re.search(r"<title>(.*?)</title>", content)
     title = _html_mod.unescape(title_m.group(1)) if title_m else "Untitled"
 
+    # Check if an explicit title was provided
+    has_title_m = re.search(r'ghostwriter:has-title" content="(\w+)"', content)
+    has_title = has_title_m and has_title_m.group(1) == "yes" if has_title_m else False
+
     desc_m = re.search(r'og:description" content="(.*?)"', content)
     desc = _html_mod.unescape(desc_m.group(1)) if desc_m else ""
 
@@ -202,7 +208,6 @@ def _parse_og_content(poem_id: str):
     else:
         lines = [desc] if desc else []
 
-    # Find cycling words: [(displayed_word, [alternatives], case_type)]
     cycling = []
     for m in re.finditer(
         r"data-original=\"([^\"]*)\"\s*"
@@ -221,7 +226,7 @@ def _parse_og_content(poem_id: str):
                 }
             )
 
-    return title, lines, cycling
+    return title, has_title, lines, cycling
 
 
 def _load_og_fonts():
@@ -280,7 +285,10 @@ _OG_FG = (44, 44, 44)
 _OG_MUTED = (176, 160, 144)
 
 
-def _render_og_frame(title, lines, font_brand, font_title, font_body, font_emoji):
+def _render_og_frame(
+    title, lines, font_brand, font_title, font_body, font_emoji,
+    *, show_title=False,
+):
     """Return an RGB PIL Image for one OG frame."""
     from PIL import Image, ImageDraw
 
@@ -320,14 +328,16 @@ def _render_og_frame(title, lines, font_brand, font_title, font_body, font_emoji
                 bbox = text_font.getbbox(ch)
                 x += (bbox[2] - bbox[0]) if bbox else 12
 
-    # Left-justified with generous margin to survive iMessage cropping
     LM = 250
 
     draw.text((LM, 100), "ghostwriter", fill=_OG_MUTED + (255,), font=font_brand)
-    _draw_line(LM, 170, title[:50], _OG_ACCENT + (255,), font_title, 44)
 
-    y = 270
-    for ln in lines[:5]:
+    y = 170
+    if show_title:
+        _draw_line(LM, y, title[:50], _OG_ACCENT + (255,), font_title, 44)
+        y = 250
+
+    for ln in lines[:6]:
         _draw_line(LM, y, ln[:60], _OG_FG + (255,), font_body, 30)
         y += 46
 
@@ -352,11 +362,11 @@ def og_image(poem_id: str):
     parsed = _parse_og_content(poem_id)
     if not parsed:
         return "Not found", 404
-    title, lines, _ = parsed
+    title, has_title, lines, _ = parsed
 
     try:
         fb, ft, fbo, fe = _load_og_fonts()
-        img = _render_og_frame(title, lines, fb, ft, fbo, fe)
+        img = _render_og_frame(title, lines, fb, ft, fbo, fe, show_title=has_title)
         buf = io.BytesIO()
         img.save(buf, format="PNG", optimize=True)
         buf.seek(0)
@@ -393,7 +403,7 @@ def og_image_gif(poem_id: str):
     parsed = _parse_og_content(poem_id)
     if not parsed:
         return "Not found", 404
-    title, lines, cycling = parsed
+    title, has_title, lines, cycling = parsed
 
     if not cycling:
         return redirect(f"/og/{poem_id}.png")
@@ -414,9 +424,11 @@ def og_image_gif(poem_id: str):
             img = Image.new("RGB", (W, H), _OG_BG)
             draw = ImageDraw.Draw(img)
             draw.text((LM, 100), "ghostwriter", fill=_OG_MUTED, font=fb)
-            draw.text((LM, 170), frame_title[:50], fill=_OG_ACCENT, font=ft)
-            y = 270
-            for ln in frame_lines[:5]:
+            y = 170
+            if has_title:
+                draw.text((LM, y), frame_title[:50], fill=_OG_ACCENT, font=ft)
+                y = 250
+            for ln in frame_lines[:6]:
                 draw.text((LM, y), ln[:60], fill=_OG_FG, font=fbo)
                 y += 46
             return img
@@ -474,6 +486,8 @@ def og_image_gif(poem_id: str):
 @app.route("/health")
 def health():
     info: dict = {"status": "ok", "model_ready": _model_ready}
+    if MORPH_SERVICE_URL:
+        info["morph_service"] = MORPH_SERVICE_URL
     if _preload_error:
         info["error"] = _preload_error
     return jsonify(info)
@@ -539,6 +553,35 @@ def api_debug():
 def api_morph():
     _require_api_key()
 
+    if MORPH_SERVICE_URL:
+        # Proxy to the external morph service
+        import urllib.request
+        import urllib.error
+
+        payload = request.get_data()
+        headers = {"Content-Type": "application/json"}
+        if API_KEY:
+            headers["X-Api-Key"] = API_KEY
+        req = urllib.request.Request(
+            f"{MORPH_SERVICE_URL}/morph",
+            data=payload,
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return app.response_class(
+                    resp.read(),
+                    status=resp.status,
+                    mimetype="application/json",
+                )
+        except urllib.error.HTTPError as e:
+            return app.response_class(
+                e.read(), status=e.code, mimetype="application/json"
+            )
+        except urllib.error.URLError as e:
+            return jsonify({"error": f"Morph service unavailable: {e.reason}"}), 503
+
     if not _model_ready:
         return jsonify({"error": "Model still loading..."}), 503
 
@@ -546,15 +589,18 @@ def api_morph():
     vibe = data.get("vibe", "")
     words = data.get("words", [])
 
-    from ghostwriter.morph import morph_word
+    from ghostwriter.morph import morph_word, morph_emoji, is_emoji
 
     results = []
     for item in words:
-        mr = morph_word(
-            item["word"],
-            vibe,
-            context=item.get("context") or None,
-        )
+        if item.get("isEmoji") or is_emoji(item["word"]):
+            mr = morph_emoji(item["word"], vibe)
+        else:
+            mr = morph_word(
+                item["word"],
+                vibe,
+                context=item.get("context") or None,
+            )
         results.append(
             {
                 "original": mr.original,
@@ -587,6 +633,7 @@ def api_save():
     data = request.get_json()
     text = data.get("text", "")
     morphed = data.get("morphed", {})
+    title = data.get("title") or None
 
     POEMS_DIR.mkdir(parents=True, exist_ok=True)
     poem_id = hashlib.sha256(
@@ -599,7 +646,7 @@ def api_save():
 
     from ghostwriter.web import render_poem_html
 
-    html = render_poem_html(text, morphed=morphed, base_url=base_url)
+    html = render_poem_html(text, morphed=morphed, title=title, base_url=base_url)
     (POEMS_DIR / f"{poem_id}.html").write_text(html, encoding="utf-8")
 
     return jsonify({"id": poem_id, "url": f"/p/{poem_id}", "full_url": base_url})

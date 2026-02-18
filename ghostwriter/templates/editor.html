@@ -419,6 +419,9 @@ button:disabled { opacity: 0.4; cursor: default; }
   <!-- ======================= Step 3: Result ====================== -->
   <section id="step-result" class="step">
     <div id="result-poem" class="poem-words"></div>
+    <div class="field" style="margin-top:0.75rem">
+      <input id="title-input" type="text" placeholder="title (optional)">
+    </div>
     <div class="actions">
       <button class="ghost-btn" onclick="backToTag()">re-tag</button>
       <span class="spacer"></span>
@@ -511,15 +514,21 @@ function adjustArticle(morphedEl, newWord) {
   if (fixed !== t) prev.textContent = fixed;
 }
 
+function isEmoji(ch) {
+  const cp = ch.codePointAt(0);
+  return (cp >= 0x1F300 && cp <= 0x1FAFF) || (cp >= 0x2600 && cp <= 0x27BF) || (cp >= 0x2300 && cp <= 0x23FF);
+}
+
 function tokenizeLine(line) {
   const tokens = [];
   let last = 0;
-  const re = /[A-Za-z]+/g;
+  const re = /[A-Za-z]+|[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{2300}-\u{23FF}]/gu;
   let m;
   while ((m = re.exec(line)) !== null) {
     if (m.index > last)
       tokens.push({text: line.slice(last, m.index), isWord: false});
-    tokens.push({text: m[0], isWord: true, tagged: false, idx: nextIdx++});
+    const emoji = isEmoji(m[0]);
+    tokens.push({text: m[0], isWord: true, isEmoji: emoji, tagged: false, idx: nextIdx++});
     last = m.index + m[0].length;
   }
   if (last < line.length)
@@ -644,8 +653,9 @@ function doMorph() {
   const words = tagged.map(tok => {
     const line = poemLines.find(l => l.tokens.includes(tok));
     return {
-      word: tok.text.toLowerCase(),
+      word: tok.isEmoji ? tok.text : tok.text.toLowerCase(),
       context: line ? getLineContext(line) : [],
+      isEmoji: !!tok.isEmoji,
     };
   });
 
@@ -929,6 +939,7 @@ function buildWordCycles() {
 function savePoem() {
   const text = buildFinalText();
   const wordCycles = buildWordCycles();
+  const title = document.getElementById('title-input').value.trim() || null;
   const btn = document.getElementById('btn-save');
   btn.disabled = true;
   btn.textContent = 'saving...';
@@ -936,7 +947,7 @@ function savePoem() {
   fetch('/api/save', {
     method: 'POST',
     headers: apiHeaders(),
-    body: JSON.stringify({text, morphed: wordCycles}),
+    body: JSON.stringify({text, morphed: wordCycles, title}),
   })
   .then(r => r.json())
   .then(data => {
