@@ -45,6 +45,12 @@ API_KEY = os.environ.get("GHOSTWRITER_API_KEY", "")
 PASSWORD = os.environ.get("GHOSTWRITER_PASSWORD", "")
 MORPH_SERVICE_URL = os.environ.get("MORPH_SERVICE_URL", "")
 
+# Clear stale OG image cache on startup (regenerated with latest rendering)
+_og_cache = POEMS_DIR / "og_cache"
+if _og_cache.is_dir():
+    import shutil
+    shutil.rmtree(_og_cache, ignore_errors=True)
+
 app = Flask(__name__)
 app.secret_key = os.environ.get(
     "FLASK_SECRET_KEY",
@@ -412,26 +418,60 @@ def og_image_gif(poem_id: str):
         from PIL import Image, ImageDraw, ImageFont
 
         W, H = 1200, 630
-        fb, ft, fbo, _ = _load_og_fonts()
+        fb, ft, fbo, fe = _load_og_fonts()
 
         max_words = max(len(c["words"]) for c in cycling)
         num_frames = min(max_words, 4)
 
         LM = 250
 
+        def _render_emoji_small(ch, target_h):
+            if not fe:
+                return None
+            try:
+                bbox = fe.getbbox(ch)
+                if not bbox or bbox[2] - bbox[0] == 0:
+                    return None
+                ew, eh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                tmp = Image.new("RGBA", (ew + 20, eh + 20), (0, 0, 0, 0))
+                ImageDraw.Draw(tmp).text(
+                    (-bbox[0], -bbox[1]), ch, font=fe, embedded_color=True
+                )
+                ratio = target_h / eh
+                return tmp.resize((max(1, int(ew * ratio)), target_h), Image.LANCZOS)
+            except Exception:
+                return None
+
+        def _draw_line_gif(img, draw, x, y, text, fill, text_font, emoji_h):
+            for ch in text:
+                if _is_emoji(ch):
+                    ei = _render_emoji_small(ch, emoji_h)
+                    if ei:
+                        img.paste(ei, (x, y), ei)
+                        x += ei.width + 2
+                    else:
+                        x += 4
+                elif ord(ch) >= 0xFE00:
+                    continue
+                else:
+                    draw.text((x, y), ch, fill=fill, font=text_font)
+                    bbox = text_font.getbbox(ch)
+                    x += (bbox[2] - bbox[0]) if bbox else 12
+
         def _render_simple(frame_title, frame_lines):
-            """Fast text-only frame (no emoji) for GIF."""
-            img = Image.new("RGB", (W, H), _OG_BG)
+            img = Image.new("RGBA", (W, H), _OG_BG + (255,))
             draw = ImageDraw.Draw(img)
-            draw.text((LM, 100), "ghostwriter", fill=_OG_MUTED, font=fb)
+            draw.text((LM, 100), "ghostwriter", fill=_OG_MUTED + (255,), font=fb)
             y = 170
             if has_title:
-                draw.text((LM, y), frame_title[:50], fill=_OG_ACCENT, font=ft)
+                _draw_line_gif(img, draw, LM, y, frame_title[:50], _OG_ACCENT + (255,), ft, 44)
                 y = 250
             for ln in frame_lines[:6]:
-                draw.text((LM, y), ln[:60], fill=_OG_FG, font=fbo)
+                _draw_line_gif(img, draw, LM, y, ln[:60], _OG_FG + (255,), fbo, 30)
                 y += 46
-            return img
+            flat = Image.new("RGB", img.size, _OG_BG)
+            flat.paste(img, mask=img.split()[3])
+            return flat
 
         frames = []
         for fi in range(num_frames):
