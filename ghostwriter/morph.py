@@ -468,14 +468,16 @@ def _get_emoji_index(model: KeyedVectors) -> tuple[dict[str, np.ndarray], list[s
 
 
 def is_emoji(text: str) -> bool:
-    """Return True if text is a single emoji character."""
-    if len(text) != 1:
+    """Return True if text starts with an emoji codepoint (handles ZWJ sequences)."""
+    if not text:
         return False
-    cp = ord(text)
+    cp = ord(text[0])
     return (
         0x1F300 <= cp <= 0x1FAFF
         or 0x2600 <= cp <= 0x27BF
         or 0x2300 <= cp <= 0x23FF
+        or 0x2B50 <= cp <= 0x2B55
+        or 0x203C <= cp <= 0x3299
     )
 
 
@@ -492,14 +494,19 @@ def morph_emoji(
     result = MorphResult(original=emoji, vibe=target_vibe, source_vibe=None)
 
     index, chars = _get_emoji_index(model)
-    if emoji not in index:
+
+    # For ZWJ sequences, use the first base emoji for lookup
+    lookup = emoji
+    if lookup not in index and len(lookup) > 1:
+        lookup = lookup[0]
+    if lookup not in index:
         return result
 
     vibe_low = target_vibe.lower()
     if not _in_vocab(model, vibe_low):
         return result
 
-    source_vec = index[emoji]
+    source_vec = index[lookup]
     vibe_vec = model[vibe_low].astype(np.float64)
     vibe_norm = np.linalg.norm(vibe_vec)
     if vibe_norm > 0:

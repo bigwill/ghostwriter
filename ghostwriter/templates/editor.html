@@ -514,15 +514,14 @@ function adjustArticle(morphedEl, newWord) {
   if (fixed !== t) prev.textContent = fixed;
 }
 
-function isEmoji(ch) {
-  const cp = ch.codePointAt(0);
-  return (cp >= 0x1F300 && cp <= 0x1FAFF) || (cp >= 0x2600 && cp <= 0x27BF) || (cp >= 0x2300 && cp <= 0x23FF);
+function isEmoji(str) {
+  return /^\p{Extended_Pictographic}/u.test(str);
 }
 
 function tokenizeLine(line) {
   const tokens = [];
   let last = 0;
-  const re = /[A-Za-z]+|[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{2300}-\u{23FF}]/gu;
+  const re = /[A-Za-z]+|(?:\p{Extended_Pictographic}[\uFE0F\u{1F3FB}-\u{1F3FF}]?)(?:\u200D\p{Extended_Pictographic}[\uFE0F\u{1F3FB}-\u{1F3FF}]?)*/gu;
   let m;
   while ((m = re.exec(line)) !== null) {
     if (m.index > last)

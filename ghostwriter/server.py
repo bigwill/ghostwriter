@@ -268,20 +268,29 @@ def _load_og_fonts():
     return _load(serif, 22), _load(serif, 44), _load(serif, 30), font_emoji
 
 
-def _is_emoji(c: str) -> bool:
-    cp = ord(c)
-    return (
-        0x1F600 <= cp <= 0x1F64F
-        or 0x1F300 <= cp <= 0x1F5FF
-        or 0x1F680 <= cp <= 0x1F6FF
-        or 0x1F900 <= cp <= 0x1F9FF
-        or 0x1FA00 <= cp <= 0x1FAFF
-        or 0x2600 <= cp <= 0x26FF
-        or 0x2700 <= cp <= 0x27BF
-        or 0x2300 <= cp <= 0x23FF
-        or 0x2B50 <= cp <= 0x2B55
-        or (0x203C <= cp <= 0x3299 and cp not in range(0x2100, 0x2200))
-    )
+_EMOJI_COMPONENT = (
+    r"[\U0001F300-\U0001FAFF\u2600-\u27BF\u2300-\u23FF\u2B50-\u2B55"
+    r"\u203C-\u3299]"
+)
+_EMOJI_SEQ_RE = re.compile(
+    _EMOJI_COMPONENT
+    + r"[\uFE0F\U0001F3FB-\U0001F3FF]?"
+    + r"(?:\u200D" + _EMOJI_COMPONENT + r"[\uFE0F\U0001F3FB-\U0001F3FF]?)*"
+)
+
+
+def _segment_line(text: str) -> list[tuple[str, str]]:
+    """Split text into ('text', ...) and ('emoji', ...) segments."""
+    segs: list[tuple[str, str]] = []
+    last = 0
+    for m in _EMOJI_SEQ_RE.finditer(text):
+        if m.start() > last:
+            segs.append(("text", text[last:m.start()]))
+        segs.append(("emoji", m.group()))
+        last = m.end()
+    if last < len(text):
+        segs.append(("text", text[last:]))
+    return segs
 
 
 _OG_W, _OG_H = 1200, 630
@@ -301,17 +310,17 @@ def _render_og_frame(
     img = Image.new("RGBA", (_OG_W, _OG_H), _OG_BG + (255,))
     draw = ImageDraw.Draw(img)
 
-    def _render_emoji(ch, target_h):
+    def _render_emoji(seq, target_h):
         if not font_emoji:
             return None
         try:
-            bbox = font_emoji.getbbox(ch)
+            bbox = font_emoji.getbbox(seq)
             if not bbox or bbox[2] - bbox[0] == 0:
                 return None
             ew, eh = bbox[2] - bbox[0], bbox[3] - bbox[1]
             tmp = Image.new("RGBA", (ew + 20, eh + 20), (0, 0, 0, 0))
             ImageDraw.Draw(tmp).text(
-                (-bbox[0], -bbox[1]), ch, font=font_emoji, embedded_color=True
+                (-bbox[0], -bbox[1]), seq, font=font_emoji, embedded_color=True
             )
             ratio = target_h / eh
             return tmp.resize((max(1, int(ew * ratio)), target_h), Image.LANCZOS)
@@ -319,20 +328,16 @@ def _render_og_frame(
             return None
 
     def _draw_line(x, y, text, fill, text_font, emoji_h):
-        for ch in text:
-            if _is_emoji(ch):
-                ei = _render_emoji(ch, emoji_h)
+        for kind, seg in _segment_line(text):
+            if kind == "emoji":
+                ei = _render_emoji(seg, emoji_h)
                 if ei:
                     img.paste(ei, (x, y), ei)
                     x += ei.width + 2
-                else:
-                    x += 4
-            elif ord(ch) >= 0xFE00:
-                continue
             else:
-                draw.text((x, y), ch, fill=fill, font=text_font)
-                bbox = text_font.getbbox(ch)
-                x += (bbox[2] - bbox[0]) if bbox else 12
+                draw.text((x, y), seg, fill=fill, font=text_font)
+                bbox = text_font.getbbox(seg)
+                x += (bbox[2] - bbox[0]) if bbox else len(seg) * 12
 
     LM = 250
 
@@ -425,17 +430,17 @@ def og_image_gif(poem_id: str):
 
         LM = 250
 
-        def _render_emoji_small(ch, target_h):
+        def _render_emoji_small(seq, target_h):
             if not fe:
                 return None
             try:
-                bbox = fe.getbbox(ch)
+                bbox = fe.getbbox(seq)
                 if not bbox or bbox[2] - bbox[0] == 0:
                     return None
                 ew, eh = bbox[2] - bbox[0], bbox[3] - bbox[1]
                 tmp = Image.new("RGBA", (ew + 20, eh + 20), (0, 0, 0, 0))
                 ImageDraw.Draw(tmp).text(
-                    (-bbox[0], -bbox[1]), ch, font=fe, embedded_color=True
+                    (-bbox[0], -bbox[1]), seq, font=fe, embedded_color=True
                 )
                 ratio = target_h / eh
                 return tmp.resize((max(1, int(ew * ratio)), target_h), Image.LANCZOS)
@@ -443,20 +448,16 @@ def og_image_gif(poem_id: str):
                 return None
 
         def _draw_line_gif(img, draw, x, y, text, fill, text_font, emoji_h):
-            for ch in text:
-                if _is_emoji(ch):
-                    ei = _render_emoji_small(ch, emoji_h)
+            for kind, seg in _segment_line(text):
+                if kind == "emoji":
+                    ei = _render_emoji_small(seg, emoji_h)
                     if ei:
                         img.paste(ei, (x, y), ei)
                         x += ei.width + 2
-                    else:
-                        x += 4
-                elif ord(ch) >= 0xFE00:
-                    continue
                 else:
-                    draw.text((x, y), ch, fill=fill, font=text_font)
-                    bbox = text_font.getbbox(ch)
-                    x += (bbox[2] - bbox[0]) if bbox else 12
+                    draw.text((x, y), seg, fill=fill, font=text_font)
+                    bbox = text_font.getbbox(seg)
+                    x += (bbox[2] - bbox[0]) if bbox else len(seg) * 12
 
         def _render_simple(frame_title, frame_lines):
             img = Image.new("RGBA", (W, H), _OG_BG + (255,))

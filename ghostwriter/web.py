@@ -14,7 +14,14 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Optional
 
-_WORD_RE = re.compile(r"[A-Za-z]+|[\U0001F300-\U0001FAFF\u2600-\u27BF\u2300-\u23FF]")
+_EMOJI_COMPONENT = (
+    r"[\U0001F300-\U0001FAFF\u2600-\u27BF\u2300-\u23FF\u2B50-\u2B55\u203C-\u3299]"
+)
+_WORD_RE = re.compile(
+    r"[A-Za-z]+"
+    r"|" + _EMOJI_COMPONENT + r"[\uFE0F\U0001F3FB-\U0001F3FF]?"
+    r"(?:\u200D" + _EMOJI_COMPONENT + r"[\uFE0F\U0001F3FB-\U0001F3FF]?)*"
+)
 
 # ---------------------------------------------------------------------------
 # HTML template
